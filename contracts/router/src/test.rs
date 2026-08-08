@@ -303,3 +303,79 @@ fn execute_batch_happy_path() {
     assert_eq!(client.get_payout_count(), 1);
 }
 
+/// Extracts the success flag (last data element) of every payout event.
+fn payout_success_flags(events: &soroban_sdk::testutils::ContractEvents) -> std::vec::Vec<bool> {
+    let tag: xdr::ScVal = xdr::ScVal::from(symbol_short!("payout"));
+    let mut flags = std::vec::Vec::new();
+    for event in events.events().iter() {
+        let xdr::ContractEventBody::V0(v0) = &event.body;
+        if v0.topics.len() >= 1 && v0.topics.get(0) == Some(&tag) {
+            let data = match &v0.data {
+                xdr::ScVal::Vec(Some(vec)) => vec,
+                _ => continue,
+            };
+            match data.last() {
+                Some(xdr::ScVal::Bool(flag)) => flags.push(*flag),
+                _ => flags.push(false),
+            }
+        }
+    }
+    flags
+}
+
+#[test]
+fn execute_batch_failed_recipient_is_refunded() {
+    let setup = setup_batch();
+    let env = setup.env;
+    let client = RouterClient::new(&env, &setup.contract_id);
+
+    let failing_recipient = Address::generate(&env);
+    let good_recipient = Address::generate(&env);
+    let recipients: Vec<Recipient> = vec![
+        &env,
+        Recipient {
+            address: failing_recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            // Floor above the deliverable 100 at the 1:1 mock venue, so the
+            // venue reverts with SlippageExceeded.
+            dest_min: 200,
+            amount_in: 100,
+        },
+        Recipient {
+            address: good_recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 50,
+            amount_in: 100,
+        },
+    ];
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &200);
+    let all_events = env.events().all();
+
+    // The failing recipient is marked failed with nothing delivered; the
+    // other recipient succeeds, so one failure never aborts the batch.
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0).unwrap().success, false);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 0);
+    assert_eq!(results.get(1).unwrap().success, true);
+    assert_eq!(results.get(1).unwrap().amount_delivered, 100);
+
+    // No destination tokens reached the failing recipient.
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&failing_recipient), 0);
+    assert_eq!(dest_client.balance(&good_recipient), 100);
+
+    // The failed recipient's source was refunded to the sender: 1_000_000
+    // minted minus the 200 batch total plus the 100 refund.
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 999_900);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+
+    // Events: one failed payout, one successful payout, one batch summary.
+    assert_eq!(count_events(&all_events, symbol_short!("payout")), 2);
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 1);
+    assert_eq!(payout_success_flags(&all_events), [false, true]);
+
+    assert_eq!(client.get_payout_count(), 1);
+}
+
