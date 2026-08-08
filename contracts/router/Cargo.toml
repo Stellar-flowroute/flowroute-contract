@@ -1,0 +1,14 @@
+[package]
+name = "flowroute-router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# soroban-sdk is pinned exactly. Latest stable release line: 27.0.5.
+[dependencies]
+soroban-sdk = "=27.0.5"
+
+[dev-dependencies]
+soroban-sdk = { version = "=27.0.5", features = ["testutils"] }

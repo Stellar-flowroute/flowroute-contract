@@ -1,0 +1,5 @@
+[toolchain]
+# Soroban tracks nightly for the wasm target. Rolling nightly resolves to the
+# locally installed 1.99.0-nightly (2026-07-25) at the time of writing.
+channel = "nightly"
+targets = ["wasm32v1-none"]

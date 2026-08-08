@@ -1,0 +1,8 @@
+[workspace]
+members = ["contracts/router"]
+resolver = "2"
+
+# The Soroban build tool (stellar contract build) requires overflow checks
+# to be enabled in the release profile to prevent silent integer overflow.
+[profile.release]
+overflow-checks = true
