@@ -2,6 +2,7 @@
 
 use soroban_sdk::{contract, contractimpl};
 
+pub mod aggregator;
 pub mod error;
 pub mod events;
 pub mod storage;
