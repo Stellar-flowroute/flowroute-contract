@@ -299,6 +299,34 @@ fn execute_batch_happy_path() {
     assert_eq!(count_events(&all_events, symbol_short!("payout")), 2);
     assert_eq!(count_events(&all_events, symbol_short!("batch")), 1);
 
+    // Lock the exact event shapes the indexer consumes. Payout topics are
+    // (payout, payout_id, sender) and data is (recipient, source_asset,
+    // dest_asset, amount_delivered, success); the batch event is (batch,
+    // payout_id, sender) with data (recipient_count, success_count,
+    // total_source_amount).
+    let (payouts, batches) = spec_events(&all_events);
+    assert_eq!(payouts.len(), 2);
+    assert_eq!(batches.len(), 1);
+    for payout in payouts.iter() {
+        assert_eq!(payout.topics[0], xdr::ScVal::from(symbol_short!("payout")));
+        assert_eq!(payout.topics[1], xdr::ScVal::U64(1));
+        assert_eq!(payout.topics[2], xdr::ScVal::from(&setup.sender));
+        assert_eq!(payout.data[1], xdr::ScVal::from(&setup.source));
+        assert_eq!(payout.data[2], xdr::ScVal::from(&setup.dest));
+        assert_eq!(payout.data[4], xdr::ScVal::Bool(true));
+    }
+    assert_eq!(payouts[0].data[0], xdr::ScVal::from(&recipient_1));
+    assert_eq!(payouts[0].data[3], scval_i128(200));
+    assert_eq!(payouts[1].data[0], xdr::ScVal::from(&recipient_2));
+    assert_eq!(payouts[1].data[3], scval_i128(100));
+    let batch = &batches[0];
+    assert_eq!(batch.topics[0], xdr::ScVal::from(symbol_short!("batch")));
+    assert_eq!(batch.topics[1], xdr::ScVal::U64(1));
+    assert_eq!(batch.topics[2], xdr::ScVal::from(&setup.sender));
+    assert_eq!(batch.data[0], xdr::ScVal::U32(2));
+    assert_eq!(batch.data[1], xdr::ScVal::U32(2));
+    assert_eq!(batch.data[2], scval_i128(300));
+
     // The payout counter advanced.
     assert_eq!(client.get_payout_count(), 1);
 }
@@ -321,6 +349,45 @@ fn payout_success_flags(events: &soroban_sdk::testutils::ContractEvents) -> std:
         }
     }
     flags
+}
+
+/// A decoded event: topics and data payload as XDR values.
+struct EventShape {
+    topics: std::vec::Vec<xdr::ScVal>,
+    data: std::vec::Vec<xdr::ScVal>,
+}
+
+/// Collects payout and batch events with their full topic/data layout, so
+/// tests can lock the exact shapes the indexer consumes.
+fn spec_events(
+    events: &soroban_sdk::testutils::ContractEvents,
+) -> (std::vec::Vec<EventShape>, std::vec::Vec<EventShape>) {
+    let payout_tag: xdr::ScVal = xdr::ScVal::from(symbol_short!("payout"));
+    let batch_tag: xdr::ScVal = xdr::ScVal::from(symbol_short!("batch"));
+    let mut payouts = std::vec::Vec::new();
+    let mut batches = std::vec::Vec::new();
+    for event in events.events().iter() {
+        let xdr::ContractEventBody::V0(v0) = &event.body;
+        let topics = v0.topics.iter().cloned().collect();
+        let data = match &v0.data {
+            xdr::ScVal::Vec(Some(vec)) => vec.iter().cloned().collect(),
+            _ => std::vec::Vec::new(),
+        };
+        let shape = EventShape { topics, data };
+        if v0.topics.len() >= 1 && v0.topics.get(0) == Some(&payout_tag) {
+            payouts.push(shape);
+        } else if v0.topics.len() >= 1 && v0.topics.get(0) == Some(&batch_tag) {
+            batches.push(shape);
+        }
+    }
+    (payouts, batches)
+}
+
+fn scval_i128(value: i128) -> xdr::ScVal {
+    xdr::ScVal::I128(xdr::Int128Parts {
+        hi: (value >> 64) as i64,
+        lo: value as u64,
+    })
 }
 
 #[test]

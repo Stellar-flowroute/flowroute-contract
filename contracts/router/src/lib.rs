@@ -86,7 +86,7 @@ impl Router {
         }
         sender.require_auth();
 
-        if recipients.len() == 0 {
+        if recipients.is_empty() {
             panic_with_error!(env, Error::EmptyBatch);
         }
         if total_source_amount <= 0 {
@@ -94,6 +94,11 @@ impl Router {
         }
         let mut allocated: i128 = 0;
         for recipient in recipients.iter() {
+            // Reject non-positive allocations; a negative amount_in could
+            // otherwise hide inside a sum that still matches the total.
+            if recipient.amount_in <= 0 {
+                panic_with_error!(env, Error::InvalidAmount);
+            }
             allocated = match allocated.checked_add(recipient.amount_in) {
                 Some(sum) => sum,
                 None => panic_with_error!(env, Error::InvalidAmount),
@@ -115,7 +120,10 @@ impl Router {
         );
 
         // Assign this run an id and record it.
-        let payout_id = storage::read_payout_count(&env) + 1;
+        let payout_id = match storage::read_payout_count(&env).checked_add(1) {
+            Some(id) => id,
+            None => panic_with_error!(env, Error::InvalidAmount),
+        };
         storage::write_payout_count(&env, &payout_id);
 
         let mut results: Vec<PayoutResult> = Vec::new(&env);
@@ -171,9 +179,14 @@ impl Router {
                     } else {
                         // Defensive branch. The venue enforces the floor
                         // internally and reverts otherwise, so a successful
-                        // call cannot deliver below dest_min. If it ever does,
-                        // the recipient is failed and the consumed source is
-                        // not refundable because it already left the contract.
+                        // call cannot deliver below dest_min. If a buggy or
+                        // dishonest venue ever returns Ok below the floor, the
+                        // recipient is failed and the consumed source is not
+                        // refundable because it already left the contract.
+                        // The delivered tokens then remain stranded here with
+                        // no rescue path, which is the accepted cost of the
+                        // spec-mandated rule that one recipient failing never
+                        // aborts the batch.
                         events::payout(
                             &env,
                             payout_id,
