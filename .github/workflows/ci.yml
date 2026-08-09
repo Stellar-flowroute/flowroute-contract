@@ -12,6 +12,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   ci:
     runs-on: ubuntu-latest
