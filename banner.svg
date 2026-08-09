@@ -1,0 +1,72 @@
+<svg width="1600" height="420" viewBox="0 0 1600 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+
+<rect width="1600" height="420" fill="#F7F5F1"></rect>
+
+<!-- Left Accent -->
+<rect x="0" y="0" width="12" height="420" fill="#0F766E"></rect>
+
+<!-- Top Route Lines -->
+<path d="M1120 70C1220 70 1280 120 1360 120C1440 120 1490 80 1600 80" stroke="#D97706" stroke-width="3" stroke-dasharray="10 10"></path>
+
+<path d="M1120 110C1220 110 1280 160 1360 160C1440 160 1490 120 1600 120" stroke="#0F766E" stroke-width="2"></path>
+
+<!-- Logo -->
+<g transform="translate(90 85)">
+    <rect width="120" height="120" rx="18" fill="#0F766E"></rect>
+    <path d="M28 32H94L62 64L94 96H72L40 64V96H28V32Z" fill="#F7F5F1"></path>
+</g>
+
+<!-- Title -->
+<text x="250" y="135" font-family="Inter,Arial,sans-serif" font-size="58" font-weight="700" fill="#111827">
+FlowRoute Contract
+</text>
+
+<text x="252" y="175" font-family="Inter,Arial,sans-serif" font-size="20" letter-spacing="3" fill="#0F766E">
+SOROBAN PAYOUT ROUTER
+</text>
+
+<!-- Tagline -->
+<text x="250" y="240" font-family="Inter,Arial,sans-serif" font-size="34" font-weight="600" fill="#111827">
+One Transaction. Many Recipients. Any Currency.
+</text>
+
+<text x="250" y="285" font-family="Inter,Arial,sans-serif" font-size="22" fill="#4B5563">
+Batch payouts with Soroswap routing, recipient protection,
+</text>
+
+<text x="250" y="318" font-family="Inter,Arial,sans-serif" font-size="22" fill="#4B5563">
+auditable settlement events, and isolated failures.
+</text>
+
+<!-- Architecture Card -->
+<rect x="1080" y="70" width="430" height="250" rx="18" fill="#FFFFFF" stroke="#E5E7EB"></rect>
+
+<circle cx="1160" cy="195" r="28" fill="#0F766E"></circle>
+<text x="1148" y="203" font-size="24" fill="white">$</text>
+
+<circle cx="1295" cy="195" r="28" fill="#D97706"></circle>
+<text x="1283" y="203" font-size="24" fill="white">⇄</text>
+
+<circle cx="1430" cy="195" r="28" fill="#0F766E"></circle>
+<text x="1418" y="203" font-size="24" fill="white">✓</text>
+
+<line x1="1188" y1="195" x2="1267" y2="195" stroke="#94A3B8" stroke-width="4"></line>
+<line x1="1323" y1="195" x2="1402" y2="195" stroke="#94A3B8" stroke-width="4"></line>
+
+<text x="1120" y="120" font-family="Inter,Arial,sans-serif" font-size="22" font-weight="600" fill="#111827">
+Execute Batch
+</text>
+
+<text x="1120" y="155" font-family="Inter,Arial,sans-serif" font-size="16" fill="#6B7280">
+Source Asset → Soroswap Router → Recipient Asset
+</text>
+
+<!-- Feature Row -->
+<line x1="90" y1="360" x2="1510" y2="360" stroke="#D6D3D1"></line>
+
+<text x="90" y="392" font-size="16" fill="#0F766E">MULTI-CURRENCY SWAPS</text>
+<text x="420" y="392" font-size="16" fill="#0F766E">MINIMUM RECEIVED GUARANTEES</text>
+<text x="850" y="392" font-size="16" fill="#0F766E">FAILURE ISOLATION</text>
+<text x="1170" y="392" font-size="16" fill="#0F766E">AUDITABLE EVENTS</text>
+
+</svg>
