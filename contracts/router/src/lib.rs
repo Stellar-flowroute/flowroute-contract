@@ -42,6 +42,11 @@ pub use types::{PayoutResult, Recipient};
 /// memory, ledger entries read and written, bytes written) stays far inside its
 /// limit at that size.
 ///
+/// Authorizing the venue's pull of the source tokens (see `aggregator`) was
+/// re-measured against the same boundary: it adds one pair resolution per
+/// distinct destination asset and one authorization per recipient, and no
+/// events, so the ceiling the event budget sets and this maximum are unchanged.
+///
 /// Enforced in `execute_batch` with the other batch guards, before the sender's
 /// total is pulled, so an oversized batch cannot move funds.
 pub const MAX_BATCH_RECIPIENTS: u32 = 6;
@@ -104,13 +109,19 @@ impl Router {
     /// nothing while spending the recipient's whole allocation and still
     /// reporting success.
     ///
-    /// Refund policy: a recipient whose swap reverts has its source amount
-    /// refunded to the sender at the end of the batch, because the venue
-    /// reverts atomically and the source never left this contract. If a venue
-    /// incorrectly returns success below dest_min, the whole invocation
-    /// reverts with VenueUnderDelivered. Soroban rolls back this batch's
-    /// earlier token transfers as well, so no partial payout or venue output
-    /// remains committed.
+    /// The venue moves the source tokens with its own transfer of the source
+    /// token, from this contract into the pair it resolves for the recipient's
+    /// asset pair. That invocation is authorized per recipient for that exact
+    /// pair and amount before the venue runs, so the pull is not rejected by
+    /// the source token's authorization check. See `aggregator::swap`.
+    ///
+    /// Refund policy: a recipient whose swap reverts, or whose pair cannot be
+    /// resolved, has its source amount refunded to the sender at the end of the
+    /// batch, because the venue reverts atomically and the source never left
+    /// this contract. If a venue incorrectly returns success below dest_min,
+    /// the whole invocation reverts with VenueUnderDelivered. Soroban rolls
+    /// back this batch's earlier token transfers as well, so no partial payout
+    /// or venue output remains committed.
     ///
     /// One recipient failing never aborts the batch.
     pub fn execute_batch(
@@ -189,6 +200,10 @@ impl Router {
         storage::write_payout_count(&env, &payout_id);
 
         let mut results: Vec<PayoutResult> = Vec::new(&env);
+        // Pairs already resolved in this run, keyed by destination asset, so a
+        // batch paying several recipients in the same asset asks the venue for
+        // the pair once instead of once per recipient.
+        let mut resolved_pairs: Vec<(Address, Address)> = Vec::new(&env);
         let mut success_count: u32 = 0;
         // Source amounts to refund to the sender for recipients whose swap
         // reverted. Such source never left this contract.
@@ -206,6 +221,7 @@ impl Router {
                 recipient.dest_min,
                 path,
                 contract_address.clone(),
+                &mut resolved_pairs,
             );
 
             match swap_outcome {

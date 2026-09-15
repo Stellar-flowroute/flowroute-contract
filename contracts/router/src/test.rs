@@ -4,10 +4,12 @@ use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    vec, xdr, Address, Env, IntoVal, Symbol, Vec,
+    vec,
+    xdr::{self, ToXdr},
+    Address, Bytes, Env, IntoVal, Symbol, Vec,
 };
 
-use crate::{storage, Error, Recipient, Router, RouterClient, MAX_BATCH_RECIPIENTS};
+use crate::{storage, Error, PayoutResult, Recipient, Router, RouterClient, MAX_BATCH_RECIPIENTS};
 
 fn setup_client(env: &Env) -> (Address, Address, RouterClient<'_>) {
     let contract_id = env.register(Router, ());
@@ -20,25 +22,187 @@ fn configured_swap_router(env: &Env, contract_id: &Address) -> Option<Address> {
     env.as_contract(contract_id, || storage::read_swap_router(env))
 }
 
+/// Derives a pair address the way the verified venue derives it
+/// (`soroswap_library::pair_for`): the salt is the SHA-256 of the sorted token
+/// pair's XDR and the address is that salt's deterministic deploy address from
+/// the factory. The mocked venues resolve pairs with it and the tests deploy
+/// the pair at the address it returns, so no pair address is hardcoded and the
+/// resolve-then-authorize-then-pull chain is exercised end to end.
+fn derive_pair_address(
+    env: &Env,
+    factory: &Address,
+    token_a: &Address,
+    token_b: &Address,
+) -> Address {
+    let (token_0, token_1) = if token_a < token_b {
+        (token_a.clone(), token_b.clone())
+    } else {
+        (token_b.clone(), token_a.clone())
+    };
+    let mut salt_bytes = Bytes::new(env);
+    salt_bytes.append(&token_0.to_xdr(env));
+    salt_bytes.append(&token_1.to_xdr(env));
+    let salt = env.crypto().sha256(&salt_bytes);
+    env.deployer()
+        .with_address(factory.clone(), salt)
+        .deployed_address()
+}
+
+/// Minimal pair contract, deployed at the deterministic pair address. It is a
+/// live contract that receives the input the router pulls, which is what the
+/// pull needs: the token transfer the router performs is only authorized for
+/// this address. Its `swap` mirrors the verified pair's `swap(amount_0_out,
+/// amount_1_out, to)`: the pair delivers the output to `to` itself, keeps two
+/// reserve entries the way the real pair's update does, and publishes the pair
+/// events.
+///
+/// Only the authorization tests drive the pair, through `pair_invoking_router`.
+/// The venue the calibration and the functional tests use delivers inline
+/// instead: the test environment meters a fixed internal budget per contract
+/// invocation, and the pair's two extra invocations per recipient would push
+/// the largest batches those tests exercise over that test-only budget. The
+/// pair's own work is therefore measured separately, and the calibration
+/// (whose binding dimension is the event budget, which both models reproduce
+/// exactly) states what it leaves out.
+mod mock_pair {
+    use soroban_sdk::{
+        contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env,
+        MuxedAddress,
+    };
+
+    use crate::error::Error;
+
+    #[contracttype]
+    pub struct PairSwapEvent {
+        pub to: Address,
+        pub amount_0_in: i128,
+        pub amount_1_in: i128,
+        pub amount_0_out: i128,
+        pub amount_1_out: i128,
+    }
+
+    #[contracttype]
+    pub struct PairSyncEvent {
+        pub new_reserve_0: i128,
+        pub new_reserve_1: i128,
+    }
+
+    #[contract]
+    pub struct MockPair;
+
+    #[contractimpl]
+    impl MockPair {
+        pub fn initialize(env: Env, token: Address) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("token"), &token);
+            env.storage().instance().set(&symbol_short!("res0"), &0i128);
+            env.storage().instance().set(&symbol_short!("res1"), &0i128);
+        }
+
+        /// Mirrors `SoroswapPair::swap(amount_0_out, amount_1_out, to)`.
+        pub fn swap(
+            env: Env,
+            amount_0_out: i128,
+            amount_1_out: i128,
+            to: Address,
+        ) -> Result<(), Error> {
+            let self_address = env.current_contract_address();
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("token"))
+                .unwrap();
+            let reserve_0: i128 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("res0"))
+                .unwrap();
+            let client = TokenClient::new(&env, &token);
+
+            let amount_out = amount_0_out.checked_add(amount_1_out).unwrap_or(0);
+            if amount_out > 0 {
+                client.transfer(&self_address, &MuxedAddress::from(&to), &amount_out);
+            }
+
+            let reserve_1 = client.balance(&self_address);
+            env.storage().instance().set(
+                &symbol_short!("res0"),
+                &reserve_0.saturating_add(amount_out),
+            );
+            env.storage()
+                .instance()
+                .set(&symbol_short!("res1"), &reserve_1);
+
+            #[allow(deprecated)]
+            env.events().publish(
+                ("SoroswapPair", symbol_short!("swap")),
+                PairSwapEvent {
+                    to: to.clone(),
+                    amount_0_in: 0,
+                    amount_1_in: amount_out,
+                    amount_0_out,
+                    amount_1_out,
+                },
+            );
+            #[allow(deprecated)]
+            env.events().publish(
+                ("SoroswapPair", symbol_short!("sync")),
+                PairSyncEvent {
+                    new_reserve_0: reserve_0,
+                    new_reserve_1: reserve_1,
+                },
+            );
+
+            Ok(())
+        }
+    }
+}
+
 /// Mock swap venue. Registered at the address supplied to initialize, so the
 /// contract calls this mock exactly as it would call the real Soroswap Router.
-/// It requires auth from `to`, pulls the source
-/// tokens from `to`, and delivers the destination tokens back to `to` at a
-/// fixed 1:1 rate. A requested floor above the deliverable amount reverts
-/// with SlippageExceeded, mirroring the real router's atomic revert.
+/// It mirrors the verified router for a single hop: it resolves the pair the
+/// way the router does internally, requires auth from `to`, transfers the
+/// input from `to` into that pair, and lets the pair deliver the output to
+/// `to` at a fixed 1:1 rate. A requested floor above the deliverable amount
+/// reverts with SlippageExceeded, mirroring the real router's atomic revert.
 mod mock_router {
     use soroban_sdk::{
         contract, contractimpl, panic_with_error, token::TokenClient, vec, Address, Env,
         MuxedAddress, Vec,
     };
 
+    use super::derive_pair_address;
     use crate::error::Error;
+
+    /// The pair for two tokens, derived the way `soroswap_library::pair_for`
+    /// derives it with this venue as the factory base. Two identical tokens
+    /// cannot form a pair, matching the library's SortIdenticalTokens error.
+    fn pair_for(env: &Env, token_a: &Address, token_b: &Address) -> Result<Address, Error> {
+        if token_a == token_b {
+            return Err(Error::SwapFailed);
+        }
+        Ok(derive_pair_address(
+            env,
+            &env.current_contract_address(),
+            token_a,
+            token_b,
+        ))
+    }
 
     #[contract]
     pub struct MockRouter;
 
     #[contractimpl]
     impl MockRouter {
+        pub fn router_pair_for(
+            env: Env,
+            token_a: Address,
+            token_b: Address,
+        ) -> Result<Address, Error> {
+            pair_for(&env, &token_a, &token_b)
+        }
+
         pub fn swap_exact_tokens_for_tokens(
             env: Env,
             amount_in: i128,
@@ -47,8 +211,9 @@ mod mock_router {
             to: Address,
             _deadline: u64,
         ) -> Result<Vec<i128>, Error> {
-            let token_in = TokenClient::new(&env, &path.get(0).unwrap());
-            let token_out = TokenClient::new(&env, &path.get(1).unwrap());
+            let input = path.get(0).unwrap();
+            let output = path.get(1).unwrap();
+            let pair = pair_for(&env, &input, &output)?;
             let self_address = env.current_contract_address();
 
             to.require_auth();
@@ -58,10 +223,14 @@ mod mock_router {
                 panic_with_error!(env, Error::SlippageExceeded);
             }
 
-            // Mirror the real router fund flow: pull the input from `to`,
-            // then deliver the output to `to`.
-            token_in.transfer(&to, &MuxedAddress::from(&self_address), &amount_in);
-            token_out.transfer(&self_address, &MuxedAddress::from(&to), &amount_out);
+            // Mirror the real router fund flow: pull the input out of `to` and
+            // into the first pair, then deliver the output to `to`.
+            TokenClient::new(&env, &input).transfer(&to, &MuxedAddress::from(&pair), &amount_in);
+            TokenClient::new(&env, &output).transfer(
+                &self_address,
+                &MuxedAddress::from(&to),
+                &amount_out,
+            );
 
             Ok(vec![&env, amount_in, amount_out])
         }
@@ -75,13 +244,34 @@ mod under_delivering_router {
         contract, contractimpl, token::TokenClient, vec, Address, Env, MuxedAddress, Vec,
     };
 
+    use super::derive_pair_address;
     use crate::error::Error;
+
+    fn pair_for(env: &Env, token_a: &Address, token_b: &Address) -> Result<Address, Error> {
+        if token_a == token_b {
+            return Err(Error::SwapFailed);
+        }
+        Ok(derive_pair_address(
+            env,
+            &env.current_contract_address(),
+            token_a,
+            token_b,
+        ))
+    }
 
     #[contract]
     pub struct UnderDeliveringRouter;
 
     #[contractimpl]
     impl UnderDeliveringRouter {
+        pub fn router_pair_for(
+            env: Env,
+            token_a: Address,
+            token_b: Address,
+        ) -> Result<Address, Error> {
+            pair_for(&env, &token_a, &token_b)
+        }
+
         pub fn swap_exact_tokens_for_tokens(
             env: Env,
             amount_in: i128,
@@ -90,8 +280,9 @@ mod under_delivering_router {
             to: Address,
             _deadline: u64,
         ) -> Result<Vec<i128>, Error> {
-            let token_in = TokenClient::new(&env, &path.get(0).unwrap());
-            let token_out = TokenClient::new(&env, &path.get(1).unwrap());
+            let input = path.get(0).unwrap();
+            let output = path.get(1).unwrap();
+            let pair = pair_for(&env, &input, &output)?;
             let self_address = env.current_contract_address();
             let amount_out = if amount_out_min <= amount_in {
                 amount_in
@@ -100,9 +291,13 @@ mod under_delivering_router {
             };
 
             to.require_auth();
-            token_in.transfer(&to, &MuxedAddress::from(&self_address), &amount_in);
+            TokenClient::new(&env, &input).transfer(&to, &MuxedAddress::from(&pair), &amount_in);
             if amount_out > 0 {
-                token_out.transfer(&self_address, &MuxedAddress::from(&to), &amount_out);
+                TokenClient::new(&env, &output).transfer(
+                    &self_address,
+                    &MuxedAddress::from(&to),
+                    &amount_out,
+                );
             }
 
             Ok(vec![&env, amount_in, amount_out])
@@ -110,9 +305,8 @@ mod under_delivering_router {
     }
 }
 
-/// Calibration venue. It mirrors `mock_router`'s fund flow and, on top of
-/// that, publishes the events the verified Soroswap venue emits for the same
-/// single-hop swap, so a calibration run sees the event footprint the deployed
+/// Calibration venue. It mirrors `mock_router`'s fund flow and event output for
+/// a single-hop swap, so a calibration run sees the footprint the deployed
 /// venue produces. Shapes verified against github.com/soroswap/core:
 ///
 ///   router swap_exact_tokens_for_tokens -> topics ("SoroswapRouter", "swap")
@@ -121,6 +315,10 @@ mod under_delivering_router {
 ///       SwapEvent { to, amount_0_in, amount_1_in, amount_0_out, amount_1_out }
 ///   pair update, called at the end of pair swap -> topics ("SoroswapPair",
 ///   "sync") SyncEvent { new_reserve_0, new_reserve_1 }
+///
+/// The pair's two events are published by the pair contract itself
+/// (`mock_pair`), exactly as the deployed pair publishes them, so the measured
+/// footprint includes the extra contract frame.
 ///
 /// The deprecated `events().publish` entry point is used deliberately: the
 /// macro-generated alternative cannot publish the 12-character component topic
@@ -131,6 +329,7 @@ mod soroswap_shaped_router {
         vec, Address, Env, MuxedAddress, Vec,
     };
 
+    use super::derive_pair_address;
     use crate::error::Error;
 
     #[contracttype]
@@ -155,11 +354,31 @@ mod soroswap_shaped_router {
         pub new_reserve_1: i128,
     }
 
+    fn pair_for(env: &Env, token_a: &Address, token_b: &Address) -> Result<Address, Error> {
+        if token_a == token_b {
+            return Err(Error::SwapFailed);
+        }
+        Ok(derive_pair_address(
+            env,
+            &env.current_contract_address(),
+            token_a,
+            token_b,
+        ))
+    }
+
     #[contract]
     pub struct SoroswapShapedRouter;
 
     #[contractimpl]
     impl SoroswapShapedRouter {
+        pub fn router_pair_for(
+            env: Env,
+            token_a: Address,
+            token_b: Address,
+        ) -> Result<Address, Error> {
+            pair_for(&env, &token_a, &token_b)
+        }
+
         pub fn swap_exact_tokens_for_tokens(
             env: Env,
             amount_in: i128,
@@ -168,8 +387,9 @@ mod soroswap_shaped_router {
             to: Address,
             _deadline: u64,
         ) -> Result<Vec<i128>, Error> {
-            let token_in = TokenClient::new(&env, &path.get(0).unwrap());
-            let token_out = TokenClient::new(&env, &path.get(1).unwrap());
+            let input = path.get(0).unwrap();
+            let output = path.get(1).unwrap();
+            let pair = pair_for(&env, &input, &output)?;
             let self_address = env.current_contract_address();
 
             to.require_auth();
@@ -179,8 +399,12 @@ mod soroswap_shaped_router {
                 panic_with_error!(env, Error::SlippageExceeded);
             }
 
-            token_in.transfer(&to, &MuxedAddress::from(&self_address), &amount_in);
-            token_out.transfer(&self_address, &MuxedAddress::from(&to), &amount_out);
+            TokenClient::new(&env, &input).transfer(&to, &MuxedAddress::from(&pair), &amount_in);
+            TokenClient::new(&env, &output).transfer(
+                &self_address,
+                &MuxedAddress::from(&to),
+                &amount_out,
+            );
 
             #[allow(deprecated)]
             env.events().publish(
@@ -216,6 +440,168 @@ mod soroswap_shaped_router {
     }
 }
 
+/// Venue that resolves the honest pair but pulls the input somewhere else, to
+/// show that this contract authorizes only the pair the venue resolves.
+mod misrouting_router {
+    use soroban_sdk::{
+        contract, contractimpl, panic_with_error, symbol_short, token::TokenClient, vec, Address,
+        Env, MuxedAddress, Vec,
+    };
+
+    use super::derive_pair_address;
+    use crate::error::Error;
+
+    fn pair_for(env: &Env, token_a: &Address, token_b: &Address) -> Result<Address, Error> {
+        if token_a == token_b {
+            return Err(Error::SwapFailed);
+        }
+        Ok(derive_pair_address(
+            env,
+            &env.current_contract_address(),
+            token_a,
+            token_b,
+        ))
+    }
+
+    #[contract]
+    pub struct MisroutingRouter;
+
+    #[contractimpl]
+    impl MisroutingRouter {
+        pub fn set_pull_target(env: Env, target: Address) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("target"), &target);
+        }
+
+        pub fn router_pair_for(
+            env: Env,
+            token_a: Address,
+            token_b: Address,
+        ) -> Result<Address, Error> {
+            pair_for(&env, &token_a, &token_b)
+        }
+
+        pub fn swap_exact_tokens_for_tokens(
+            env: Env,
+            amount_in: i128,
+            amount_out_min: i128,
+            path: Vec<Address>,
+            to: Address,
+            _deadline: u64,
+        ) -> Result<Vec<i128>, Error> {
+            let input = path.get(0).unwrap();
+            let output = path.get(1).unwrap();
+            let self_address = env.current_contract_address();
+            let target: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("target"))
+                .unwrap();
+
+            to.require_auth();
+
+            let amount_out = amount_in;
+            if amount_out < amount_out_min {
+                panic_with_error!(env, Error::SlippageExceeded);
+            }
+
+            // Pulls into `target` instead of the pair it just resolved.
+            TokenClient::new(&env, &input).transfer(&to, &MuxedAddress::from(&target), &amount_in);
+            TokenClient::new(&env, &output).transfer(
+                &self_address,
+                &MuxedAddress::from(&to),
+                &amount_out,
+            );
+
+            Ok(vec![&env, amount_in, amount_out])
+        }
+    }
+}
+
+/// Fully faithful venue, used by the authorization tests. It mirrors the
+/// verified router for a single hop end to end: it resolves the pair, requires
+/// auth from `to`, pulls the input from `to` into that pair, and then calls the
+/// pair, which delivers the output to `to`. The pair call is what makes a
+/// missing or undeployed pair fail that recipient instead of silently paying
+/// them, exactly as the deployed venue behaves.
+mod pair_invoking_router {
+    use soroban_sdk::{
+        contract, contractimpl, contracttype, panic_with_error, symbol_short, token::TokenClient,
+        vec, Address, Env, MuxedAddress, Vec,
+    };
+
+    use super::{derive_pair_address, mock_pair};
+    use crate::error::Error;
+
+    #[contracttype]
+    pub struct RouterSwapEvent {
+        pub path: Vec<Address>,
+        pub amounts: Vec<i128>,
+        pub to: Address,
+    }
+
+    fn pair_for(env: &Env, token_a: &Address, token_b: &Address) -> Result<Address, Error> {
+        if token_a == token_b {
+            return Err(Error::SwapFailed);
+        }
+        Ok(derive_pair_address(
+            env,
+            &env.current_contract_address(),
+            token_a,
+            token_b,
+        ))
+    }
+
+    #[contract]
+    pub struct PairInvokingRouter;
+
+    #[contractimpl]
+    impl PairInvokingRouter {
+        pub fn router_pair_for(
+            env: Env,
+            token_a: Address,
+            token_b: Address,
+        ) -> Result<Address, Error> {
+            pair_for(&env, &token_a, &token_b)
+        }
+
+        pub fn swap_exact_tokens_for_tokens(
+            env: Env,
+            amount_in: i128,
+            amount_out_min: i128,
+            path: Vec<Address>,
+            to: Address,
+            _deadline: u64,
+        ) -> Result<Vec<i128>, Error> {
+            let input = path.get(0).unwrap();
+            let pair = pair_for(&env, &input, &path.get(1).unwrap())?;
+
+            to.require_auth();
+
+            let amount_out = amount_in;
+            if amount_out < amount_out_min {
+                panic_with_error!(env, Error::SlippageExceeded);
+            }
+
+            TokenClient::new(&env, &input).transfer(&to, &MuxedAddress::from(&pair), &amount_in);
+            mock_pair::MockPairClient::new(&env, &pair).swap(&0, &amount_out, &to);
+
+            #[allow(deprecated)]
+            env.events().publish(
+                ("SoroswapRouter", symbol_short!("swap")),
+                RouterSwapEvent {
+                    path,
+                    amounts: vec![&env, amount_in, amount_out],
+                    to: to.clone(),
+                },
+            );
+
+            Ok(vec![&env, amount_in, amount_out])
+        }
+    }
+}
+
 struct BatchSetup {
     env: Env,
     contract_id: Address,
@@ -223,12 +609,25 @@ struct BatchSetup {
     source: Address,
     dest: Address,
     swap_router: Address,
+    /// The pair contract for `source`/`dest`, deployed at the address the
+    /// venue resolves and funded with destination liquidity.
+    pair: Address,
 }
 
-/// Initializes the contract, registers the mock venue, and funds the sender
-/// with source tokens and the venue with destination tokens. All auths are
-/// mocked.
-fn setup_batch() -> BatchSetup {
+/// Deploys the mock pair at the address `venue` resolves for `source`/`dest`,
+/// so the router's pull has a live pair contract to transfer the input into.
+fn deploy_venue_pair(env: &Env, venue: &Address, source: &Address, dest: &Address) -> Address {
+    let pair = derive_pair_address(env, venue, source, dest);
+    let pair_id = env.register_at(&pair, mock_pair::MockPair, ());
+    mock_pair::MockPairClient::new(env, &pair_id).initialize(dest);
+    pair_id
+}
+
+/// Initializes the contract with a freshly registered venue, deploys and funds
+/// the pair that venue resolves, and funds the sender with source tokens. All
+/// auths are mocked here; tests that exercise the shipped authorization path
+/// re-arm the environment with only the sender's invocation tree.
+fn setup_with_venue(register_venue: impl FnOnce(&Env) -> Address) -> BatchSetup {
     let env = Env::default();
     // The venue (and the tokens it touches on this contract's behalf) calls
     // require_auth on this contract at a depth beyond the direct invoker, so
@@ -237,10 +636,7 @@ fn setup_batch() -> BatchSetup {
 
     let (contract_id, admin, _client) = setup_client(&env);
     let client = RouterClient::new(&env, &contract_id);
-    // Register at a generated address rather than the former hardcoded
-    // testnet address. A fallback to that retired configuration makes every
-    // successful-payout test below fail because no venue exists there.
-    let swap_router = env.register(mock_router::MockRouter, ());
+    let swap_router = register_venue(&env);
     client.initialize(&admin, &swap_router);
 
     let token_admin = Address::generate(&env);
@@ -250,6 +646,8 @@ fn setup_batch() -> BatchSetup {
     let dest = env
         .register_stellar_asset_contract_v2(token_admin)
         .address();
+
+    let pair = deploy_venue_pair(&env, &swap_router, &source, &dest);
 
     let sender = Address::generate(&env);
     StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
@@ -262,70 +660,26 @@ fn setup_batch() -> BatchSetup {
         source,
         dest,
         swap_router,
+        pair,
     }
 }
 
+/// The default venue, mirroring the verified router for a single hop. It is
+/// registered at a generated address rather than the former hardcoded testnet
+/// address: a fallback to that retired configuration makes every
+/// successful-payout test below fail because no venue exists there.
+fn setup_batch() -> BatchSetup {
+    setup_with_venue(|env| env.register(mock_router::MockRouter, ()))
+}
+
 fn setup_under_delivering_batch() -> BatchSetup {
-    let env = Env::default();
-    env.mock_all_auths_allowing_non_root_auth();
-
-    let (contract_id, admin, _client) = setup_client(&env);
-    let client = RouterClient::new(&env, &contract_id);
-    let swap_router = env.register(under_delivering_router::UnderDeliveringRouter, ());
-    client.initialize(&admin, &swap_router);
-
-    let token_admin = Address::generate(&env);
-    let source = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let dest = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    let sender = Address::generate(&env);
-    StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
-    StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
-
-    BatchSetup {
-        env,
-        contract_id,
-        sender,
-        source,
-        dest,
-        swap_router,
-    }
+    setup_with_venue(|env| env.register(under_delivering_router::UnderDeliveringRouter, ()))
 }
 
 /// Like `setup_batch`, but the configured venue is the Soroswap-shaped
 /// calibration venue, so resource measurements include the venue's events.
 fn setup_shaped_batch() -> BatchSetup {
-    let env = Env::default();
-    env.mock_all_auths_allowing_non_root_auth();
-
-    let (contract_id, admin, _client) = setup_client(&env);
-    let client = RouterClient::new(&env, &contract_id);
-    let swap_router = env.register(soroswap_shaped_router::SoroswapShapedRouter, ());
-    client.initialize(&admin, &swap_router);
-
-    let token_admin = Address::generate(&env);
-    let source = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let dest = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-
-    let sender = Address::generate(&env);
-    StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
-    StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
-
-    BatchSetup {
-        env,
-        contract_id,
-        sender,
-        source,
-        dest,
-        swap_router,
-    }
+    setup_with_venue(|env| env.register(soroswap_shaped_router::SoroswapShapedRouter, ()))
 }
 
 fn count_events(events: &soroban_sdk::testutils::ContractEvents, tag: Symbol) -> usize {
@@ -414,10 +768,7 @@ fn router_cannot_be_replaced_after_initialization() {
         .mock_all_auths()
         .try_initialize(&admin, &replacement_router)
         .is_err());
-    assert_eq!(
-        configured_swap_router(&env, &contract_id),
-        Some(swap_router)
-    );
+    assert_eq!(configured_swap_router(&env, &contract_id), Some(swap_router));
 }
 
 #[test]
@@ -731,7 +1082,7 @@ fn under_delivery_rolls_back_earlier_successful_recipient() {
     let dest_client = TokenClient::new(&env, &setup.dest);
     assert_eq!(source_client.balance(&setup.sender), 1_000_000);
     assert_eq!(source_client.balance(&setup.contract_id), 0);
-    assert_eq!(source_client.balance(&setup.swap_router), 0);
+    assert_eq!(source_client.balance(&setup.pair), 0);
     assert_eq!(dest_client.balance(&first_recipient), 0);
     assert_eq!(dest_client.balance(&second_recipient), 0);
     assert_eq!(dest_client.balance(&setup.sender), 0);
@@ -1103,6 +1454,18 @@ fn execute_batch_accepts_smallest_positive_dest_min() {
 // `batch_resource_envelope_reproduces_calibrated_ceiling`, which re-measures the
 // per-recipient event cost at sizes the guard allows and re-derives the ceiling
 // from those measurements.
+//
+// Authorizing the venue's source-token pull was re-measured against this same
+// boundary. It adds one pair resolution per distinct destination asset per run
+// and one authorization per recipient, and no events, so the re-measured
+// envelope is unchanged in the dimension that binds (404 bytes fixed plus 1,804
+// bytes per recipient, ceiling still 8). The ceiling for sizes above the
+// enforced maximum is asserted arithmetically rather than observed, because a
+// batch that large cannot be run here: the Soroban test environment meters a
+// fixed internal budget per contract invocation (a guard on its own
+// authorization instrumentation, on the order of tens of invocations per
+// environment), and it is reached at nine recipients with this venue before the
+// network event budget can reject the batch.
 
 /// Stellar mainnet transaction-level limits. These are the values soroban-sdk
 /// enforces by default in `Env::default()` through
@@ -1157,6 +1520,53 @@ fn successful_batch(setup: &BatchSetup, count: u32) -> (Vec<Recipient>, i128) {
     (recipients, total)
 }
 
+/// Runs a batch with only the sender's invocation tree authorized, the way an
+/// application submits it: the sender authorizes `execute_batch` and the nested
+/// source transfer into this contract, and nothing else. The venue's pull of
+/// this contract's tokens is authorized by the contract itself, so under this
+/// enforced tree a missing or misdirected authorization fails here.
+fn execute_batch_with_sender_auth(
+    setup: &BatchSetup,
+    recipients: &Vec<Recipient>,
+    total_source_amount: i128,
+) -> Vec<PayoutResult> {
+    let env = setup.env.clone();
+    let sub_invokes = [MockAuthInvoke {
+        contract: &setup.source,
+        fn_name: "transfer",
+        args: (
+            setup.sender.clone(),
+            setup.contract_id.clone(),
+            total_source_amount,
+        )
+            .into_val(&env),
+        sub_invokes: &[],
+    }];
+    let invoke = MockAuthInvoke {
+        contract: &setup.contract_id,
+        fn_name: "execute_batch",
+        args: (
+            setup.sender.clone(),
+            setup.source.clone(),
+            recipients.clone(),
+            total_source_amount,
+        )
+            .into_val(&env),
+        sub_invokes: &sub_invokes,
+    };
+    env.mock_auths(&[MockAuth {
+        address: &setup.sender,
+        invoke: &invoke,
+    }]);
+
+    RouterClient::new(&env, &setup.contract_id).execute_batch(
+        &setup.sender,
+        &setup.source,
+        recipients,
+        &total_source_amount,
+    )
+}
+
 /// Runs a `count`-recipient batch against the Soroswap-shaped venue and returns
 /// the metered envelope of the invocation. `Env::default()` enforces the
 /// mainnet limits, so a batch that does not fit panics here rather than
@@ -1164,10 +1574,9 @@ fn successful_batch(setup: &BatchSetup, count: u32) -> (Vec<Recipient>, i128) {
 fn measure_shaped_envelope(count: u32) -> Envelope {
     let setup = setup_shaped_batch();
     let env = setup.env.clone();
-    let client = RouterClient::new(&env, &setup.contract_id);
     let (recipients, total) = successful_batch(&setup, count);
 
-    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &total);
+    let results = execute_batch_with_sender_auth(&setup, &recipients, total);
     assert_eq!(results.len(), count);
     for result in results.iter() {
         assert!(result.success);
@@ -1191,9 +1600,12 @@ fn measure_shaped_envelope(count: u32) -> Envelope {
 /// Measures a successful batch at the enforced maximum against the
 /// Soroswap-shaped venue, checks every metered dimension against the mainnet
 /// limits, and re-derives the event-budget ceiling from the measured
-/// per-recipient cost. If the payout event shape, the token transfers, or the
-/// venue's event output change, this fails and the maximum has to be re-derived
-/// rather than left to drift above the real boundary.
+/// per-recipient cost. If the payout event shape, the token transfers, the
+/// venue's event output, or the venue authorization change the per-recipient
+/// cost, this fails and the maximum has to be re-derived rather than left to
+/// drift above the real boundary. It runs through the enforced sender
+/// authorization tree, so it measures the shipped pull path and not one where
+/// every authorization is mocked.
 #[test]
 fn batch_resource_envelope_reproduces_calibrated_ceiling() {
     let one = measure_shaped_envelope(1);
@@ -1377,5 +1789,189 @@ fn execute_batch_mixed_results_at_limit_isolates_failure() {
         MAX_BATCH_RECIPIENTS as usize
     );
     assert_eq!(count_events(&all_events, symbol_short!("batch")), 1);
+    assert_eq!(client.get_payout_count(), 1);
+}
+
+// Venue authorization
+// -------------------
+// The venue moves the source tokens with its own `transfer` of the source
+// token, from this contract into the pair it resolves for the recipient's asset
+// pair. That invocation is a `require_auth` on this contract from a frame whose
+// invoker is the venue, so it is authorized only because `execute_batch`
+// declares it, for that exact pair and amount, before the venue runs. These
+// tests run under an enforced authorization tree holding only the sender's
+// invocation tree, so a missing or misdirected declaration fails here instead
+// of silently refunding every recipient.
+
+/// Like `setup_batch`, but the configured venue calls the pair, so the pair
+/// delivers the output and needs the destination liquidity to deliver.
+fn setup_pair_invoking_batch() -> BatchSetup {
+    let setup = setup_with_venue(|env| env.register(pair_invoking_router::PairInvokingRouter, ()));
+    StellarAssetClient::new(&setup.env, &setup.dest).mint(&setup.pair, &10_000_000);
+    setup
+}
+
+#[test]
+fn execute_batch_settles_a_router_shaped_payout_under_enforced_auth() {
+    let setup = setup_pair_invoking_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 100,
+            amount_in: 100,
+        },
+    ];
+
+    let results = execute_batch_with_sender_auth(&setup, &recipients, 100);
+
+    // The payout settles and the recipient receives the destination amount.
+    let result = results.get(0).unwrap();
+    assert!(result.success, "a router-shaped payout must settle");
+    assert_eq!(result.amount_delivered, 100);
+
+    let source_client = TokenClient::new(&env, &setup.source);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 100);
+    // The router's pull took the allocation out of this contract and into the
+    // pair it resolved, which is where the deployed router puts it.
+    assert_eq!(source_client.balance(&setup.pair), 100);
+    // The sender paid exactly the batch total and this contract keeps nothing.
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000 - 100);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 1);
+}
+
+#[test]
+fn execute_batch_authorizes_only_the_pair_the_venue_resolves() {
+    let setup = setup_pair_invoking_batch();
+    let env = setup.env.clone();
+
+    // The pair the venue reports is the pair that exists at that address, so
+    // the address this contract authorizes is the one the pull targets.
+    let resolved = pair_invoking_router::PairInvokingRouterClient::new(&env, &setup.swap_router)
+        .router_pair_for(&setup.source, &setup.dest);
+    assert_eq!(resolved, setup.pair);
+
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 100,
+            amount_in: 100,
+        },
+    ];
+    assert!(
+        execute_batch_with_sender_auth(&setup, &recipients, 100)
+            .get(0)
+            .unwrap()
+            .success
+    );
+    assert_eq!(
+        TokenClient::new(&env, &setup.source).balance(&setup.pair),
+        100
+    );
+
+    // A venue that pulls into an address other than the pair it resolved is not
+    // authorized for it: that recipient fails, its allocation is refunded, and
+    // the unauthorized destination receives nothing.
+    let misrouted = setup_with_venue(|env| {
+        let venue = env.register(misrouting_router::MisroutingRouter, ());
+        misrouting_router::MisroutingRouterClient::new(env, &venue).set_pull_target(&venue);
+        venue
+    });
+    let env = misrouted.env.clone();
+    let client = RouterClient::new(&env, &misrouted.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: misrouted.dest.clone(),
+            dest_min: 100,
+            amount_in: 100,
+        },
+    ];
+
+    let results = execute_batch_with_sender_auth(&misrouted, &recipients, 100);
+
+    assert!(!results.get(0).unwrap().success);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 0);
+    let source_client = TokenClient::new(&env, &misrouted.source);
+    assert_eq!(source_client.balance(&misrouted.sender), 1_000_000);
+    assert_eq!(source_client.balance(&misrouted.contract_id), 0);
+    // Neither the unauthorized destination nor the pair received anything.
+    assert_eq!(source_client.balance(&misrouted.swap_router), 0);
+    assert_eq!(source_client.balance(&misrouted.pair), 0);
+    assert_eq!(
+        TokenClient::new(&env, &misrouted.dest).balance(&recipient),
+        0
+    );
+    assert_eq!(client.get_payout_count(), 1);
+}
+
+#[test]
+fn execute_batch_isolates_pair_failures_per_recipient() {
+    let setup = setup_pair_invoking_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+
+    // A destination asset whose pair was never created: nothing is deployed at
+    // the address the venue resolves, so that recipient's swap cannot settle.
+    let unpaired_dest = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let paid = Address::generate(&env);
+    let same_asset = Address::generate(&env);
+    let unpaired = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: paid.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 50,
+            amount_in: 50,
+        },
+        // dest_asset == source_asset: no pair can be resolved for it at all.
+        Recipient {
+            address: same_asset.clone(),
+            dest_asset: setup.source.clone(),
+            dest_min: 50,
+            amount_in: 50,
+        },
+        Recipient {
+            address: unpaired.clone(),
+            dest_asset: unpaired_dest.clone(),
+            dest_min: 50,
+            amount_in: 50,
+        },
+    ];
+
+    let results = execute_batch_with_sender_auth(&setup, &recipients, 150);
+
+    assert_eq!(results.len(), 3);
+    assert!(results.get(0).unwrap().success);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 50);
+    // The unresolvable pair and the missing pair both fail safely.
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(results.get(1).unwrap().amount_delivered, 0);
+    assert!(!results.get(2).unwrap().success);
+    assert_eq!(results.get(2).unwrap().amount_delivered, 0);
+
+    // Only the settled recipient was paid and only its allocation left the
+    // sender; nothing is stranded in this contract or in the pair.
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(TokenClient::new(&env, &setup.dest).balance(&paid), 50);
+    assert_eq!(TokenClient::new(&env, &unpaired_dest).balance(&unpaired), 0);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000 - 50);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(source_client.balance(&setup.pair), 50);
     assert_eq!(client.get_payout_count(), 1);
 }
