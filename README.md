@@ -46,7 +46,10 @@ stellar contract invoke \
   --admin <ADMIN_ADDRESS>
 ```
 
-This is the exact build, deploy, and initialize sequence used for the live testnet deployment listed under Contract addresses.
+The initializer must authorize as the supplied admin: `test-deployer` must be
+that address or one of its signers. This is the exact build, deploy, and
+initialize sequence used for the live testnet deployment listed under Contract
+addresses.
 
 ## Key Features
 
@@ -61,7 +64,7 @@ This is the exact build, deploy, and initialize sequence used for the live testn
 
 The router is a single Soroban contract in `contracts/router`. Storage holds the admin address, a paused flag, and a payout counter; swaps are delegated to the Soroswap Router venue. The public surface is four functions:
 
-- `initialize(admin)` sets the admin, clears the paused flag, and resets the payout counter. The first caller becomes admin at deploy time.
+- `initialize(admin)` sets the admin, clears the paused flag, and resets the payout counter. It requires authorization from the supplied admin.
 - `set_paused(paused)` pauses or unpauses the batch executor. Requires admin auth.
 - `get_payout_count()` returns the number of payout runs executed so far.
 - `execute_batch(sender, source_asset, recipients, total_source_amount)` executes one payout run. It validates the batch, pulls the total amount from the sender, swaps each recipient's allocation on the venue with the recipient's `dest_min` enforced as the output floor, emits per-recipient and per-run events, refunds failed swaps to the sender, and never aborts on a single failure.

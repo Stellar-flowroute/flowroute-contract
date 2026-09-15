@@ -23,12 +23,14 @@ pub struct Router;
 #[contractimpl]
 impl Router {
     /// Sets the admin, clears the paused flag, and resets the payout counter.
-    /// Takes no auth: the first caller sets the admin at deploy time. Reverts
-    /// with AlreadyInitialized if the contract was already initialized.
+    /// Requires authorization from the supplied admin so an unrelated caller
+    /// cannot claim an uninitialized deployment. Reverts with
+    /// AlreadyInitialized if the contract was already initialized.
     pub fn initialize(env: Env, admin: Address) {
         if storage::read_admin(&env).is_some() {
             panic_with_error!(env, Error::AlreadyInitialized);
         }
+        admin.require_auth();
         storage::write_admin(&env, &admin);
         storage::write_paused(&env, &false);
         storage::write_payout_count(&env, &0);

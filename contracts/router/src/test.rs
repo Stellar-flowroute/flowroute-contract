@@ -1,8 +1,10 @@
 extern crate std;
 
 use soroban_sdk::{
-    symbol_short, testutils::{Address as _, Events}, token::{StellarAssetClient, TokenClient},
-    vec, Address, Env, Symbol, Vec, xdr,
+    symbol_short,
+    testutils::{Address as _, Events, MockAuth, MockAuthInvoke},
+    token::{StellarAssetClient, TokenClient},
+    vec, xdr, Address, Env, IntoVal, Symbol, Vec,
 };
 
 use crate::{aggregator, Recipient, Router, RouterClient};
@@ -123,15 +125,61 @@ fn count_events(events: &soroban_sdk::testutils::ContractEvents, tag: Symbol) ->
 #[test]
 fn initialize_sets_admin() {
     let env = Env::default();
-    let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    let (contract_id, admin, client) = setup_client(&env);
+    client
+        .mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (&admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .initialize(&admin);
+}
+
+#[test]
+fn initialize_requires_supplied_admin_auth() {
+    let env = Env::default();
+    let (contract_id, admin, client) = setup_client(&env);
+    let other = Address::generate(&env);
+
+    assert!(client.try_initialize(&admin).is_err());
+
+    // Authorization from an address other than the proposed admin cannot
+    // initialize the contract.
+    assert!(client
+        .mock_auths(&[MockAuth {
+            address: &other,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (&admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_initialize(&admin)
+        .is_err());
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (&admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .initialize(&admin);
 }
 
 #[test]
 fn initialize_second_call_reverts() {
     let env = Env::default();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.mock_all_auths().initialize(&admin);
 
     let other = Address::generate(&env);
     assert!(client.try_initialize(&other).is_err());
@@ -141,7 +189,7 @@ fn initialize_second_call_reverts() {
 fn set_paused_requires_admin_auth() {
     let env = Env::default();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.mock_all_auths().initialize(&admin);
 
     // No auth is mocked for the admin signature, so the call reverts.
     assert!(client.try_set_paused(&true).is_err());
@@ -171,7 +219,7 @@ fn set_paused_before_initialize_reverts() {
 fn get_payout_count_starts_at_zero() {
     let env = Env::default();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.mock_all_auths().initialize(&admin);
 
     assert_eq!(client.get_payout_count(), 0);
 }
@@ -445,4 +493,3 @@ fn execute_batch_failed_recipient_is_refunded() {
 
     assert_eq!(client.get_payout_count(), 1);
 }
-
