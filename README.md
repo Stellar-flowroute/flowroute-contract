@@ -54,9 +54,12 @@ that address or one of its signers. The external Soroswap Router address is a
 testnet-specific deployment dependency; supply the appropriate verified venue
 address when deploying to another network.
 
-This API change requires a fresh FlowRoute Router deployment. The existing
-testnet FlowRoute Router listed below was initialized with the prior interface
-and is not changed by this release.
+This API change requires a fresh FlowRoute Router deployment, and the current
+release has one: the deployment recorded in [Live testnet
+verification](#live-testnet-verification) below was built from this revision and
+initialized with the Soroswap Router above. The earlier testnet FlowRoute Router
+listed further down was initialized with the prior interface and is not changed
+by this release.
 
 ## Key Features
 
@@ -122,10 +125,84 @@ Re-run the calibration:
 cargo test --lib batch_resource_envelope -- --nocapture
 ```
 
+## Live testnet verification
+
+The current release was deployed to Stellar Testnet and exercised end to end
+against the live Soroswap Router and its pools. No mock venue is involved in any
+of the evidence below. Verified 2026-09-15.
+
+| Item | Value |
+| --- | --- |
+| Network | Testnet (`Test SDF Network ; September 2015`) |
+| Source revision | `2933107` |
+| WASM sha256 | `0c2251cd29b10ab20966b4189a4c1a800e758c0edaf733bce48d26bff843fb7a` (30,530 bytes, byte-identical after a clean rebuild, and the hash the network recorded for the deployed instance) |
+| WASM upload tx | [`967cb00d153bae61f67cfe369de92960535dcfa7d832d45f1b52242d4a254909`](https://stellar.expert/explorer/testnet/tx/967cb00d153bae61f67cfe369de92960535dcfa7d832d45f1b52242d4a254909) |
+| Deploy tx | [`9a384afc053c76f816c40a3de63b75f836ea634349c55e2b548cd63a9f2702b4`](https://stellar.expert/explorer/testnet/tx/9a384afc053c76f816c40a3de63b75f836ea634349c55e2b548cd63a9f2702b4) |
+| Contract | [`CBB3UVMGMFVWLF6ZVMQYRQDWOXZUWNW4SD6SERG3RMLFXMWLZNOZ767U`](https://stellar.expert/explorer/testnet/contract/CBB3UVMGMFVWLF6ZVMQYRQDWOXZUWNW4SD6SERG3RMLFXMWLZNOZ767U) |
+| Initialize tx | [`07a09da09e5d015ad3f2d02cb19eb1b9a85a4e583e7c19ad04b9bc782b156a19`](https://stellar.expert/explorer/testnet/tx/07a09da09e5d015ad3f2d02cb19eb1b9a85a4e583e7c19ad04b9bc782b156a19) (ledger 4,691,023) |
+| Source asset | XLM, the native asset contract `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` |
+| Destination assets | USDC `CB3TLW74NBIOT3BUWOZ3TUM6RFDF6A4GVIRUQRQZABG5KPOUL4JJOV2F`, XTAR `CCZGLAUBDKJSQK72QOZHVU7CUWKW45OZWYWCLL27AEK74U2OIBK6LXF2` |
+| Venue | Soroswap Router `CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD`, factory `CDP3HMUH6SMS3S7NPGNDJLULCOXXEPSHY4JKUKMBNQMATHDHWXRRJTBY` |
+
+Every row below is a real signed transaction, submitted to Testnet and then
+confirmed independently through Soroban RPC `getTransaction` and Horizon rather
+than trusted from CLI output.
+
+| Test | Expected | Actual | Tx hash | Result |
+| --- | --- | --- | --- | --- |
+| Single-recipient payout, XLM→USDC, `amount_in` 10 XLM, `dest_min` 0.7 USDC | recipient receives ≥ `dest_min`, no residue | delivered 7,617,467 (0.7617 USDC); contract holds 0 XLM and 0 USDC; counter 1 | [`f2bade9f…`](https://stellar.expert/explorer/testnet/tx/f2bade9f6228b5f52ef4211632ff3a97f5ae054c9013e428fbd87b6d4750e8b2) (ledger 4,691,030) | ok |
+| Maximum batch, 6 recipients (5× XLM→USDC, 1× XLM→XTAR), 10 XLM each, total 60 XLM | all six receive ≥ their floor, no residue, counter increments once | all six delivered; each amount equalled the on-chain quote exactly (7,610,530 / 7,603,602 / 7,596,684 / 7,589,775 / 7,582,876 USDC, 91,658,230 XTAR); contract holds 0 of XLM, USDC and XTAR; counter 2 | [`f2114a2e…`](https://stellar.expert/explorer/testnet/tx/f2114a2e08fe2e2869921a589a9cc7dc0cd681cd2c71b1cc1ef048f578afbbe3) (ledger 4,691,040) | ok |
+| 7 recipients | rejected before any transfer | `TooManyRecipients`; sender, contract and counter unchanged; no event | RPC simulation | ok |
+| `dest_min = 0` | rejected before any transfer | `InvalidAmount`; sender, contract and counter unchanged; no event | RPC simulation | ok |
+| batch while paused | rejected before any transfer | `Paused`; sender, contract and counter unchanged; no event | RPC simulation | ok |
+| second `initialize` | rejected | `AlreadyInitialized` | RPC simulation | ok |
+
+The rejection cases are labelled by the error the contract returned. Each failed
+before any transfer, and after each attempt the sender's balance, this
+contract's balances for all three assets, the payout counter and the event log
+were re-read and were unchanged. The unpause and pause calls around the paused
+case were themselves real transactions.
+
+On-chain settlement detail. The events of both payout runs show the venue's pull
+exactly as the authorization fix intends: XLM moves sender → FlowRoute, then
+FlowRoute → the pair the venue resolves (`CDVAIOYHCD4RUSLQNVFI7RIZBFT2JZMJWM4RTOLQZQXL4QAVXU5RFKDB`
+for USDC, `CDH4NEG6TAII2AXGJY52WSMMOGCPMFIQBBH245ATW2TIZ7MBYM23YOAR` for XTAR),
+then the destination token moves pair → FlowRoute → recipient, followed by the
+`SoroswapPair` and `SoroswapRouter` events and this contract's own `payout` and
+`batch` events. Because the batch pays two different destination assets, it also
+shows the per-destination pair resolution working: two resolutions, six
+per-recipient authorizations. RPC's event log for the contract records 7
+`payout` events and 2 `batch` events — one batch per run, one payout per
+recipient — and none from the rejected calls.
+
+Resources measured on that real transaction, not in the test environment:
+
+| Quantity | 6 recipients | Network limit |
+| --- | --- | --- |
+| CPU instructions | 29,851,229 | 400,000,000 |
+| Ledger footprint keys | 20 | 400 |
+| Bytes written | 3,636 | 132,096 |
+| Contract events | 10,384 B across 46 events | 16,384 B |
+
+For comparison the same reconstruction gives 2,244 B across 11 events for the
+single-recipient run. The event dimension is the one that bounds the batch, and
+the live figure confirms the calibration's margin: the maximum batch uses about
+63% of the event budget. The live instruction count is far above the
+test-environment calibration of about 5.2M because the live run also executes
+the real pair contract, which the calibration venue does not.
+
+Two limits on this evidence. The four rejected cases were verified by RPC
+simulation against live ledger state: that executes the deployed contract and
+returns the contract error but commits nothing, so they have no failed on-chain
+transaction of their own. And the ceiling itself is only exercised here at 6
+recipients — the committed calibration test, which pushes past the ceiling, runs
+in the Soroban test environment rather than on the network.
+
 ## Existing contract addresses (testnet)
 
 | Contract | Address |
 | --- | --- |
+| FlowRoute Router (this release, verified live) | `CBB3UVMGMFVWLF6ZVMQYRQDWOXZUWNW4SD6SERG3RMLFXMWLZNOZ767U` |
 | FlowRoute Router (prior interface) | `CBDWWJOW25KPUID432RZXFIPLHRYZY5KIXBT7FMC2L6LHFOITBMUX5LE` |
 | External Soroswap Router | `CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD` |
 
