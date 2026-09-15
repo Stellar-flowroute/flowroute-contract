@@ -30,8 +30,8 @@ pub const DEADLINE_BUFFER_SECONDS: u64 = 300;
 // first pair contract. FlowRoute therefore passes itself as `to`, measures
 // its own destination-token balance delta after the call, and only forwards
 // the received amount to the recipient when it satisfies the per-recipient
-// floor. A non-conforming successful response below that floor is returned to
-// the sender by the calling contract.
+// floor. A non-conforming successful response below that floor is rejected by
+// the calling contract.
 //
 // Aggregator follow-up, verified interface from github.com/soroswap/aggregator,
 // contracts/aggregator/src/lib.rs and contracts/aggregator/src/models.rs:

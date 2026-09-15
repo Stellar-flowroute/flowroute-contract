@@ -62,7 +62,7 @@ and is not changed by this release.
 
 - **Batched payouts.** One transaction funds any number of recipients. The full source amount is pulled from the sender once and distributed in the same call.
 - **Multi-currency delivery.** Each recipient names a destination asset, and the router converts the source asset through the Soroswap Router.
-- **On-chain slippage floor.** Every recipient sets a minimum received amount (`dest_min`). FlowRoute measures the per-swap balance delta itself: an under-floor venue response is a failed payout, and any received destination tokens are returned to the sender rather than retained by the contract.
+- **On-chain slippage floor.** Every recipient sets a minimum received amount (`dest_min`). FlowRoute measures the per-swap balance delta itself: an under-floor venue response returns `VenueUnderDelivered` and aborts the batch with an atomic rollback, so no partial payout or destination output is retained by the contract.
 - **Auditable settlement.** Each payout run and every per-recipient result is emitted as an on-chain event, and a payout counter records how many runs have executed.
 - **Failure isolation.** One recipient failing never aborts the batch. A swap that reverts is refunded to the sender at the end of the run.
 - **Pause switch.** The admin can pause execution between runs.

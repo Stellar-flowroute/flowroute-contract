@@ -12,4 +12,5 @@ pub enum Error {
     EmptyBatch = 6,
     InvalidAmount = 7,
     SwapFailed = 8,
+    VenueUnderDelivered = 9,
 }

@@ -93,10 +93,10 @@ mod under_delivering_router {
             let token_in = TokenClient::new(&env, &path.get(0).unwrap());
             let token_out = TokenClient::new(&env, &path.get(1).unwrap());
             let self_address = env.current_contract_address();
-            let amount_out = if amount_out_min > 0 {
-                amount_out_min - 1
+            let amount_out = if amount_out_min <= amount_in {
+                amount_in
             } else {
-                0
+                amount_out_min - 1
             };
 
             to.require_auth();
@@ -524,7 +524,7 @@ fn execute_batch_exact_dest_min_succeeds() {
 }
 
 #[test]
-fn under_delivering_success_returns_destination_output_to_sender() {
+fn under_delivering_success_reverts_atomically() {
     let setup = setup_under_delivering_batch();
     let env = setup.env;
     let client = RouterClient::new(&env, &setup.contract_id);
@@ -534,30 +534,69 @@ fn under_delivering_success_returns_destination_output_to_sender() {
         Recipient {
             address: recipient.clone(),
             dest_asset: setup.dest.clone(),
-            dest_min: 100,
+            dest_min: 200,
             amount_in: 100,
         },
     ];
 
-    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &100);
+    let results = client.try_execute_batch(&setup.sender, &setup.source, &recipients, &100);
     let all_events = env.events().all();
 
-    // The malicious venue returned Ok after sending 99, but the recipient is
-    // not partially paid and FlowRoute retains none of that current swap's
-    // destination output.
-    assert_eq!(results.get(0).unwrap().success, false);
-    assert_eq!(results.get(0).unwrap().amount_delivered, 0);
+    // The malicious venue returned Ok after sending 199, but the invocation
+    // reverts because that is below the requested floor of 200.
+    assert!(results.is_err());
     let dest_client = TokenClient::new(&env, &setup.dest);
     assert_eq!(dest_client.balance(&recipient), 0);
-    assert_eq!(dest_client.balance(&setup.sender), 99);
+    assert_eq!(dest_client.balance(&setup.sender), 0);
     assert_eq!(dest_client.balance(&setup.contract_id), 0);
-    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.sender), 999_900);
+    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.sender), 1_000_000);
     assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.contract_id), 0);
+    assert_eq!(dest_client.balance(&setup.swap_router), 10_000_000);
 
     let (payouts, _) = spec_events(&all_events);
-    assert_eq!(payouts.len(), 1);
-    assert_eq!(payouts[0].data[3], scval_i128(0));
-    assert_eq!(payouts[0].data[4], xdr::ScVal::Bool(false));
+    assert!(payouts.is_empty());
+}
+
+#[test]
+fn under_delivery_rolls_back_earlier_successful_recipient() {
+    let setup = setup_under_delivering_batch();
+    let env = setup.env;
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let first_recipient = Address::generate(&env);
+    let second_recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: first_recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 50,
+            amount_in: 100,
+        },
+        Recipient {
+            address: second_recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 200,
+            amount_in: 100,
+        },
+    ];
+
+    // The first swap would succeed, but the second non-conforming response
+    // aborts the outer invocation and rolls the first payout back as well.
+    assert!(client
+        .try_execute_batch(&setup.sender, &setup.source, &recipients, &200)
+        .is_err());
+
+    let source_client = TokenClient::new(&env, &setup.source);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(source_client.balance(&setup.swap_router), 0);
+    assert_eq!(dest_client.balance(&first_recipient), 0);
+    assert_eq!(dest_client.balance(&second_recipient), 0);
+    assert_eq!(dest_client.balance(&setup.sender), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(dest_client.balance(&setup.swap_router), 10_000_000);
+    assert!(spec_events(&env.events().all()).0.is_empty());
 }
 
 #[test]

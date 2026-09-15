@@ -70,9 +70,10 @@ impl Router {
     /// Refund policy: a recipient whose swap reverts has its source amount
     /// refunded to the sender at the end of the batch, because the venue
     /// reverts atomically and the source never left this contract. If a venue
-    /// incorrectly returns success below dest_min, its measured destination
-    /// output is returned to the sender immediately; the recipient receives
-    /// nothing and the payout is recorded as failed.
+    /// incorrectly returns success below dest_min, the whole invocation
+    /// reverts with VenueUnderDelivered. Soroban rolls back this batch's
+    /// earlier token transfers as well, so no partial payout or venue output
+    /// remains committed.
     ///
     /// One recipient failing never aborts the batch.
     pub fn execute_batch(
@@ -187,33 +188,11 @@ impl Router {
                         });
                     } else {
                         // A non-conforming venue may return Ok while sending
-                        // less than its requested floor. Do not pay a partial
-                        // amount to the recipient or retain it here: return
-                        // exactly this swap's measured delta to the sender.
-                        // The balance delta excludes any pre-existing balance
-                        // of this destination asset in the contract.
-                        if received > 0 {
-                            dest_client.transfer(
-                                &contract_address,
-                                &MuxedAddress::from(&sender),
-                                &received,
-                            );
-                        }
-                        events::payout(
-                            &env,
-                            payout_id,
-                            &sender,
-                            &recipient.address,
-                            &source_asset,
-                            &recipient.dest_asset,
-                            0,
-                            false,
-                        );
-                        results.push_back(PayoutResult {
-                            recipient: recipient.address.clone(),
-                            success: false,
-                            amount_delivered: 0,
-                        });
+                        // less than its requested floor. Abort the entire
+                        // invocation so Soroban rolls back this batch's
+                        // earlier transfers and no partial output is left
+                        // stranded or delivered below the requested floor.
+                        panic_with_error!(env, Error::VenueUnderDelivered);
                     }
                 }
                 Err(_) => {
