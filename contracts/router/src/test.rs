@@ -7,7 +7,7 @@ use soroban_sdk::{
     vec, xdr, Address, Env, IntoVal, Symbol, Vec,
 };
 
-use crate::{storage, Recipient, Router, RouterClient};
+use crate::{storage, Error, Recipient, Router, RouterClient, MAX_BATCH_RECIPIENTS};
 
 fn setup_client(env: &Env) -> (Address, Address, RouterClient<'_>) {
     let contract_id = env.register(Router, ());
@@ -110,6 +110,112 @@ mod under_delivering_router {
     }
 }
 
+/// Calibration venue. It mirrors `mock_router`'s fund flow and, on top of
+/// that, publishes the events the verified Soroswap venue emits for the same
+/// single-hop swap, so a calibration run sees the event footprint the deployed
+/// venue produces. Shapes verified against github.com/soroswap/core:
+///
+///   router swap_exact_tokens_for_tokens -> topics ("SoroswapRouter", "swap")
+///       SwapEvent { path: Vec<Address>, amounts: Vec<i128>, to: Address }
+///   pair swap -> topics ("SoroswapPair", "swap")
+///       SwapEvent { to, amount_0_in, amount_1_in, amount_0_out, amount_1_out }
+///   pair update, called at the end of pair swap -> topics ("SoroswapPair",
+///   "sync") SyncEvent { new_reserve_0, new_reserve_1 }
+///
+/// The deprecated `events().publish` entry point is used deliberately: the
+/// macro-generated alternative cannot publish the 12-character component topic
+/// names the venue uses.
+mod soroswap_shaped_router {
+    use soroban_sdk::{
+        contract, contractimpl, contracttype, panic_with_error, symbol_short, token::TokenClient,
+        vec, Address, Env, MuxedAddress, Vec,
+    };
+
+    use crate::error::Error;
+
+    #[contracttype]
+    pub struct RouterSwapEvent {
+        pub path: Vec<Address>,
+        pub amounts: Vec<i128>,
+        pub to: Address,
+    }
+
+    #[contracttype]
+    pub struct PairSwapEvent {
+        pub to: Address,
+        pub amount_0_in: i128,
+        pub amount_1_in: i128,
+        pub amount_0_out: i128,
+        pub amount_1_out: i128,
+    }
+
+    #[contracttype]
+    pub struct PairSyncEvent {
+        pub new_reserve_0: i128,
+        pub new_reserve_1: i128,
+    }
+
+    #[contract]
+    pub struct SoroswapShapedRouter;
+
+    #[contractimpl]
+    impl SoroswapShapedRouter {
+        pub fn swap_exact_tokens_for_tokens(
+            env: Env,
+            amount_in: i128,
+            amount_out_min: i128,
+            path: Vec<Address>,
+            to: Address,
+            _deadline: u64,
+        ) -> Result<Vec<i128>, Error> {
+            let token_in = TokenClient::new(&env, &path.get(0).unwrap());
+            let token_out = TokenClient::new(&env, &path.get(1).unwrap());
+            let self_address = env.current_contract_address();
+
+            to.require_auth();
+
+            let amount_out = amount_in;
+            if amount_out < amount_out_min {
+                panic_with_error!(env, Error::SlippageExceeded);
+            }
+
+            token_in.transfer(&to, &MuxedAddress::from(&self_address), &amount_in);
+            token_out.transfer(&self_address, &MuxedAddress::from(&to), &amount_out);
+
+            #[allow(deprecated)]
+            env.events().publish(
+                ("SoroswapRouter", symbol_short!("swap")),
+                RouterSwapEvent {
+                    path,
+                    amounts: vec![&env, amount_in, amount_out],
+                    to: to.clone(),
+                },
+            );
+            #[allow(deprecated)]
+            env.events().publish(
+                ("SoroswapPair", symbol_short!("swap")),
+                PairSwapEvent {
+                    to: to.clone(),
+                    amount_0_in: amount_in,
+                    amount_1_in: 0,
+                    amount_0_out: 0,
+                    amount_1_out: amount_out,
+                },
+            );
+            #[allow(deprecated)]
+            env.events().publish(
+                ("SoroswapPair", symbol_short!("sync")),
+                PairSyncEvent {
+                    new_reserve_0: amount_in,
+                    new_reserve_1: amount_out,
+                },
+            );
+
+            Ok(vec![&env, amount_in, amount_out])
+        }
+    }
+}
+
 struct BatchSetup {
     env: Env,
     contract_id: Address,
@@ -175,6 +281,39 @@ fn setup_under_delivering_batch() -> BatchSetup {
     let dest = env
         .register_stellar_asset_contract_v2(token_admin)
         .address();
+    let sender = Address::generate(&env);
+    StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
+    StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
+
+    BatchSetup {
+        env,
+        contract_id,
+        sender,
+        source,
+        dest,
+        swap_router,
+    }
+}
+
+/// Like `setup_batch`, but the configured venue is the Soroswap-shaped
+/// calibration venue, so resource measurements include the venue's events.
+fn setup_shaped_batch() -> BatchSetup {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (contract_id, admin, _client) = setup_client(&env);
+    let client = RouterClient::new(&env, &contract_id);
+    let swap_router = env.register(soroswap_shaped_router::SoroswapShapedRouter, ());
+    client.initialize(&admin, &swap_router);
+
+    let token_admin = Address::generate(&env);
+    let source = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let dest = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
     let sender = Address::generate(&env);
     StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
     StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
@@ -769,4 +908,305 @@ fn all_reverted_swaps_refund_all_source() {
     assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.sender), 1_000_000);
     assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.contract_id), 0);
     assert_eq!(TokenClient::new(&env, &setup.dest).balance(&setup.contract_id), 0);
+}
+
+// Batch size limit
+// ----------------
+// `MAX_BATCH_RECIPIENTS` is derived from measured resource usage. Each
+// recipient costs one FlowRoute `payout` event plus the events its token
+// transfers and its venue swap emit, and a transaction may emit at most 16,384
+// bytes of contract events. The boundary was located by running successful
+// batches at increasing sizes with the network limits enforced, so the failing
+// size is reported by the host rather than assumed:
+//
+//   * minimal venue (mirrors the router's fund flow only): 16 recipients fit
+//     at 16,212 event bytes, 17 are rejected because "contract events size
+//     bytes: 17200 > 16384".
+//   * Soroswap-shaped venue (adds the router and pair events for one hop): 8
+//     recipients fit at 14,836 event bytes, 9 are rejected because "contract
+//     events size bytes: 16640 > 16384".
+//
+// CPU instructions, memory, ledger entries read and written, and bytes written
+// stay far inside their limits at every size measured, so the event budget is
+// the binding constraint. Those two sweeps ran against the pre-enforcement
+// revision; once the limit is enforced, a batch above it is rejected by the
+// contract, so the calibrated boundary is pinned by
+// `batch_resource_envelope_reproduces_calibrated_ceiling`, which re-measures the
+// per-recipient event cost at sizes the guard allows and re-derives the ceiling
+// from those measurements.
+
+/// Stellar mainnet transaction-level limits. These are the values soroban-sdk
+/// enforces by default in `Env::default()` through
+/// `InvocationResourceLimits::mainnet()`. The limits type is not re-exported by
+/// `soroban_sdk::testutils`, so the values are repeated here; they are also the
+/// values the test environment enforces, so a drift in either direction makes
+/// these tests fail instead of passing silently.
+const MAINNET_INSTRUCTIONS: i64 = 400_000_000;
+const MAINNET_MEM_BYTES: i64 = 41_943_040;
+const MAINNET_DISK_READ_ENTRIES: u32 = 200;
+const MAINNET_WRITE_ENTRIES: u32 = 200;
+const MAINNET_LEDGER_ENTRIES: u32 = 400;
+const MAINNET_DISK_READ_BYTES: u32 = 200_000;
+const MAINNET_WRITE_BYTES: u32 = 132_096;
+const MAINNET_CONTRACT_EVENTS_SIZE_BYTES: u32 = 16_384;
+
+/// One invocation's metered resource usage, copied out of the SDK's
+/// `InvocationResources` so these tests do not depend on that type being
+/// nameable from this crate.
+#[derive(Debug)]
+struct Envelope {
+    instructions: i64,
+    mem_bytes: i64,
+    disk_read_entries: u32,
+    memory_read_entries: u32,
+    write_entries: u32,
+    disk_read_bytes: u32,
+    write_bytes: u32,
+    contract_events_size_bytes: u32,
+}
+
+impl Envelope {
+    fn ledger_entries(&self) -> u32 {
+        self.disk_read_entries + self.memory_read_entries + self.write_entries
+    }
+}
+
+/// Every recipient asks for the 1:1 amount the mock venue can deliver, so the
+/// batch is a realistic successful batch.
+fn successful_batch(setup: &BatchSetup, count: u32) -> (Vec<Recipient>, i128) {
+    let mut recipients: Vec<Recipient> = Vec::new(&setup.env);
+    let mut total: i128 = 0;
+    for _ in 0..count {
+        recipients.push_back(Recipient {
+            address: Address::generate(&setup.env),
+            dest_asset: setup.dest.clone(),
+            dest_min: 50,
+            amount_in: 50,
+        });
+        total += 50;
+    }
+    (recipients, total)
+}
+
+/// Runs a `count`-recipient batch against the Soroswap-shaped venue and returns
+/// the metered envelope of the invocation. `Env::default()` enforces the
+/// mainnet limits, so a batch that does not fit panics here rather than
+/// returning.
+fn measure_shaped_envelope(count: u32) -> Envelope {
+    let setup = setup_shaped_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let (recipients, total) = successful_batch(&setup, count);
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &total);
+    assert_eq!(results.len(), count);
+    for result in results.iter() {
+        assert!(result.success);
+    }
+
+    let resources = env.cost_estimate().resources();
+    Envelope {
+        instructions: resources.instructions,
+        mem_bytes: resources.mem_bytes,
+        disk_read_entries: resources.disk_read_entries,
+        memory_read_entries: resources.memory_read_entries,
+        write_entries: resources.write_entries,
+        disk_read_bytes: resources.disk_read_bytes,
+        write_bytes: resources.write_bytes,
+        contract_events_size_bytes: resources.contract_events_size_bytes,
+    }
+}
+
+/// Calibration and regression guard for `MAX_BATCH_RECIPIENTS`.
+///
+/// Measures a successful batch at the enforced maximum against the
+/// Soroswap-shaped venue, checks every metered dimension against the mainnet
+/// limits, and re-derives the event-budget ceiling from the measured
+/// per-recipient cost. If the payout event shape, the token transfers, or the
+/// venue's event output change, this fails and the maximum has to be re-derived
+/// rather than left to drift above the real boundary.
+#[test]
+fn batch_resource_envelope_reproduces_calibrated_ceiling() {
+    let one = measure_shaped_envelope(1);
+    let cap = measure_shaped_envelope(MAX_BATCH_RECIPIENTS);
+    std::println!("recipients=1  {one:?}");
+    std::println!("recipients={MAX_BATCH_RECIPIENTS}  {cap:?}");
+
+    // Every dimension is inside the mainnet limit at the enforced maximum.
+    assert!(cap.instructions < MAINNET_INSTRUCTIONS);
+    assert!(cap.mem_bytes < MAINNET_MEM_BYTES);
+    assert!(cap.disk_read_entries <= MAINNET_DISK_READ_ENTRIES);
+    assert!(cap.ledger_entries() <= MAINNET_LEDGER_ENTRIES);
+    assert!(cap.write_entries <= MAINNET_WRITE_ENTRIES);
+    assert!(cap.disk_read_bytes <= MAINNET_DISK_READ_BYTES);
+    assert!(cap.write_bytes <= MAINNET_WRITE_BYTES);
+    assert!(cap.contract_events_size_bytes <= MAINNET_CONTRACT_EVENTS_SIZE_BYTES);
+
+    // The event footprint is linear in the recipient count: the batch event
+    // and the source transfer are fixed costs and every recipient adds the same
+    // payout event plus the same token and venue events. Fit those two
+    // constants from the two measurements and project the largest batch the
+    // event budget allows.
+    let one_events = i64::from(one.contract_events_size_bytes);
+    let cap_events = i64::from(cap.contract_events_size_bytes);
+    let per_recipient = (cap_events - one_events) / i64::from(MAX_BATCH_RECIPIENTS - 1);
+    let fixed = one_events - per_recipient;
+    assert_eq!(
+        per_recipient, 1_804,
+        "per-recipient event bytes changed; re-derive MAX_BATCH_RECIPIENTS"
+    );
+    assert_eq!(
+        fixed, 404,
+        "fixed per-batch event bytes changed; re-derive MAX_BATCH_RECIPIENTS"
+    );
+    let ceiling = (i64::from(MAINNET_CONTRACT_EVENTS_SIZE_BYTES) - fixed) / per_recipient;
+    assert_eq!(
+        ceiling, 8,
+        "the event budget no longer fits 8 recipients; re-derive MAX_BATCH_RECIPIENTS"
+    );
+    assert!(
+        i64::from(MAX_BATCH_RECIPIENTS) < ceiling,
+        "MAX_BATCH_RECIPIENTS must stay below the measured event-budget ceiling"
+    );
+
+    // At the maximum, the event budget is the dimension under the most
+    // pressure, and it still has headroom.
+    assert!(
+        cap.contract_events_size_bytes * 4 < MAINNET_CONTRACT_EVENTS_SIZE_BYTES * 3,
+        "the enforced maximum should leave at least a quarter of the event budget unused"
+    );
+    assert!(cap.instructions * 20 < MAINNET_INSTRUCTIONS);
+    assert!(cap.mem_bytes * 10 < MAINNET_MEM_BYTES);
+}
+
+#[test]
+fn execute_batch_one_below_limit_succeeds() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let count = MAX_BATCH_RECIPIENTS - 1;
+    let (recipients, total) = successful_batch(&setup, count);
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &total);
+
+    assert_eq!(results.len(), count);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    for result in results.iter() {
+        assert!(result.success);
+        assert_eq!(result.amount_delivered, 50);
+        assert_eq!(dest_client.balance(&result.recipient), 50);
+    }
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000 - total);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 1);
+}
+
+#[test]
+fn execute_batch_at_limit_succeeds() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let (recipients, total) = successful_batch(&setup, MAX_BATCH_RECIPIENTS);
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &total);
+    let all_events = env.events().all();
+
+    assert_eq!(results.len(), MAX_BATCH_RECIPIENTS);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    for result in results.iter() {
+        assert!(result.success);
+        assert_eq!(result.amount_delivered, 50);
+        assert_eq!(dest_client.balance(&result.recipient), 50);
+    }
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000 - total);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 1);
+    assert_eq!(
+        count_events(&all_events, symbol_short!("payout")),
+        MAX_BATCH_RECIPIENTS as usize
+    );
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 1);
+}
+
+#[test]
+fn execute_batch_above_limit_is_rejected_before_funds_move() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let (recipients, total) = successful_batch(&setup, MAX_BATCH_RECIPIENTS + 1);
+
+    let err = match client.try_execute_batch(&setup.sender, &setup.source, &recipients, &total) {
+        Ok(_) => panic!("a batch above MAX_BATCH_RECIPIENTS must be rejected"),
+        Err(err) => err,
+    };
+    let all_events = env.events().all();
+
+    // The caller gets the named contract error, not a network resource failure.
+    let err = err.unwrap();
+    assert!(err.is_type(xdr::ScErrorType::Contract));
+    assert_eq!(err.get_code(), Error::TooManyRecipients as u32);
+
+    // And the rejection happens before any token movement: the sender was not
+    // debited, this contract holds nothing, no payout was recorded, and no
+    // event was emitted.
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(TokenClient::new(&env, &setup.dest).balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("payout")), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 0);
+}
+
+#[test]
+fn execute_batch_mixed_results_at_limit_isolates_failure() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let (mut recipients, total) = successful_batch(&setup, MAX_BATCH_RECIPIENTS);
+
+    // Make the second recipient's floor higher than the venue can deliver at
+    // its 1:1 rate, so that swap reverts while the rest of the batch succeeds.
+    let failing_address = Address::generate(&env);
+    recipients.set(
+        1,
+        Recipient {
+            address: failing_address.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 200,
+            amount_in: 50,
+        },
+    );
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &total);
+    let all_events = env.events().all();
+
+    assert_eq!(results.len(), MAX_BATCH_RECIPIENTS);
+    assert_eq!(results.get(0).unwrap().success, true);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 50);
+    assert_eq!(results.get(1).unwrap().success, false);
+    assert_eq!(results.get(1).unwrap().amount_delivered, 0);
+    for index in 2..MAX_BATCH_RECIPIENTS {
+        assert_eq!(results.get(index).unwrap().success, true);
+    }
+
+    // The failed recipient received nothing and its source came back to the
+    // sender; the contract keeps no source or destination tokens.
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&failing_address), 0);
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000 - total + 50);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+
+    assert_eq!(
+        count_events(&all_events, symbol_short!("payout")),
+        MAX_BATCH_RECIPIENTS as usize
+    );
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 1);
+    assert_eq!(client.get_payout_count(), 1);
 }

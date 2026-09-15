@@ -60,7 +60,7 @@ and is not changed by this release.
 
 ## Key Features
 
-- **Batched payouts.** One transaction funds any number of recipients. The full source amount is pulled from the sender once and distributed in the same call.
+- **Batched payouts.** One transaction funds up to `MAX_BATCH_RECIPIENTS` recipients (see [Batch size limit](#batch-size-limit)). The full source amount is pulled from the sender once and distributed in the same call.
 - **Multi-currency delivery.** Each recipient names a destination asset, and the router converts the source asset through the Soroswap Router.
 - **On-chain slippage floor.** Every recipient sets a minimum received amount (`dest_min`). FlowRoute measures the per-swap balance delta itself: an under-floor venue response returns `VenueUnderDelivered` and aborts the batch with an atomic rollback, so no partial payout or destination output is retained by the contract.
 - **Auditable settlement.** Each payout run and every per-recipient result is emitted as an on-chain event, and a payout counter records how many runs have executed.
@@ -74,9 +74,38 @@ The router is a single Soroban contract in `contracts/router`. Storage holds the
 - `initialize(admin, swap_router)` sets the admin and immutable Soroswap Router venue, clears the paused flag, and resets the payout counter. It requires authorization from the supplied admin.
 - `set_paused(paused)` pauses or unpauses the batch executor. Requires admin auth.
 - `get_payout_count()` returns the number of payout runs executed so far.
-- `execute_batch(sender, source_asset, recipients, total_source_amount)` executes one payout run. It validates the batch, pulls the total amount from the sender, swaps each recipient's allocation on the venue with the recipient's `dest_min` enforced as the output floor, emits per-recipient and per-run events, refunds failed swaps to the sender, and never aborts on a single failure.
+- `execute_batch(sender, source_asset, recipients, total_source_amount)` executes one payout run. It validates the batch, rejects batches larger than `MAX_BATCH_RECIPIENTS` before moving any funds, pulls the total amount from the sender, swaps each recipient's allocation on the venue with the recipient's `dest_min` enforced as the output floor, emits per-recipient and per-run events, refunds failed swaps to the sender, and never aborts on a single failure.
 
 The application layer lives in the sibling repository `flowroute-app`.
+
+## Batch size limit
+
+`execute_batch` accepts at most `MAX_BATCH_RECIPIENTS` recipients per call (6 as of this release). The limit is checked with the other batch guards, before the total is pulled from the sender, so an oversized batch reverts with `Error::TooManyRecipients` (code 10) and the sender's funds are never touched. Longer payout runs must be split into several calls.
+
+The number is measured, not picked: one recipient costs the FlowRoute `payout` event plus the events that recipient's token transfers and swap emit, and a Stellar transaction may emit at most 16,384 bytes of contract events (`tx_max_contract_events_size_bytes`). That event budget, not CPU or memory, is what bounds the batch.
+
+Calibration, run with the network transaction limits enforced (the default in the Soroban test environment, so an oversized batch fails during the test rather than silently passing). Each row uses a venue that reproduces the verified Soroswap router and pair event output for a single-hop swap:
+
+| Recipients | Contract events (bytes) | Share of the event budget | Result |
+| --- | --- | --- | --- |
+| 1 | 2,208 | 13% | ok |
+| 6 (`MAX_BATCH_RECIPIENTS`) | 11,228 | 69% | ok |
+| 7 | 13,032 | 80% | ok |
+| 8 | 14,836 | 91% | ok |
+| 9 | 16,640 | 102% | rejected: `contract events size bytes: 16640 > 16384` |
+| 10 | 18,444 | 113% | rejected |
+| 12 | 22,052 | 135% | rejected |
+| 16 | 29,268 | 179% | rejected |
+
+Every other resource stays far inside its own limit. At the enforced maximum the whole envelope is 4,888,900 CPU instructions (1.2% of 400,000,000), 673,873 bytes of memory (1.6% of 41,943,040), 45 ledger entries read or written (11% of 400) and 3,296 bytes written to the ledger (2.5% of 132,096). Nothing else comes close even at much larger sizes: repeated against a venue that mirrors the router's fund flow but publishes none of the router's or pair's events, the event budget is exhausted at 17 recipients (`17200 > 16384`), and the next constraint behind it, the 400-entry footprint cap, is not reached until roughly 94 recipients.
+
+The event footprint is exactly linear in the recipient count, 404 bytes of fixed cost (the batch event plus the single source transfer) plus 1,804 bytes per recipient, so the ceiling can be re-derived from smaller measurements. `batch_resource_envelope_reproduces_calibrated_ceiling` in `contracts/router/src/test.rs` re-measures the envelope at 1 and 6 recipients, checks every dimension against the network limits, and fails if the derived ceiling is no longer 8, so the maximum cannot drift above a changed event footprint unnoticed. The rows above the enforced maximum come from a sweep run before the limit was added; the committed test re-derives the ceiling from measurements the guard still allows.
+
+Re-run the calibration:
+
+```bash
+cargo test --lib batch_resource_envelope -- --nocapture
+```
 
 ## Existing contract addresses (testnet)
 

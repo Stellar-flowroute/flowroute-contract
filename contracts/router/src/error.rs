@@ -13,4 +13,5 @@ pub enum Error {
     InvalidAmount = 7,
     SwapFailed = 8,
     VenueUnderDelivered = 9,
+    TooManyRecipients = 10,
 }

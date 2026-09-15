@@ -17,6 +17,35 @@ mod test;
 pub use error::Error;
 pub use types::{PayoutResult, Recipient};
 
+/// Maximum number of recipients accepted by one `execute_batch` call.
+///
+/// The value comes from measured resource usage, not from a round number. Every
+/// recipient costs one `payout` event plus the events the destination token and
+/// the swap venue emit, and a Stellar transaction may emit at most 16,384 bytes
+/// of contract events (`tx_max_contract_events_size_bytes`), so the batch size
+/// is bounded by the event budget rather than by CPU or memory.
+///
+/// Calibration with the network limits enforced (see the `README.md` section
+/// "Batch size limit" and
+/// `test::batch_resource_envelope_reproduces_calibrated_ceiling`):
+///
+/// * with a minimal venue that only mirrors the router's fund flow, 16
+///   recipients fit (16,212 event bytes) and 17 are rejected by the network
+///   limit (`contract events size bytes: 17200 > 16384`);
+/// * with a venue that also publishes the verified Soroswap router and pair
+///   events for a single-hop swap, 8 recipients fit (14,836 event bytes) and 9
+///   are rejected (`16640 > 16384`).
+///
+/// The production-shaped boundary of 8 is the one that matters, and this
+/// maximum sits a quarter below it, leaving about 31% of the event budget
+/// unused at the maximum. Every other resource dimension (CPU instructions,
+/// memory, ledger entries read and written, bytes written) stays far inside its
+/// limit at that size.
+///
+/// Enforced in `execute_batch` with the other batch guards, before the sender's
+/// total is pulled, so an oversized batch cannot move funds.
+pub const MAX_BATCH_RECIPIENTS: u32 = 6;
+
 #[contract]
 pub struct Router;
 
@@ -62,10 +91,11 @@ impl Router {
     /// Executes one payout run.
     ///
     /// Guards in order: not initialized, paused, sender auth, batch not
-    /// empty, amounts consistent. The full total_source_amount is pulled from
-    /// the sender into this contract, then each recipient's allocation is
-    /// swapped on the venue with the recipient's dest_min enforced as the
-    /// output floor.
+    /// empty, batch within MAX_BATCH_RECIPIENTS, amounts consistent. Every
+    /// guard rejects with the sender's funds untouched; the full
+    /// total_source_amount is pulled from the sender into this contract only
+    /// after all of them pass, then each recipient's allocation is swapped on
+    /// the venue with the recipient's dest_min enforced as the output floor.
     ///
     /// Refund policy: a recipient whose swap reverts has its source amount
     /// refunded to the sender at the end of the batch, because the venue
@@ -97,6 +127,13 @@ impl Router {
 
         if recipients.is_empty() {
             panic_with_error!(env, Error::EmptyBatch);
+        }
+        // Reject oversized batches here, with the other batch guards and
+        // before the sender's total is pulled: a batch above this maximum
+        // cannot fit the transaction's contract-event budget, and the caller
+        // gets a named error instead of a network resource failure.
+        if recipients.len() > MAX_BATCH_RECIPIENTS {
+            panic_with_error!(env, Error::TooManyRecipients);
         }
         if total_source_amount <= 0 {
             panic_with_error!(env, Error::InvalidAmount);
