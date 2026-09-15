@@ -11,7 +11,9 @@ pub struct Recipient {
     pub dest_asset: Address,
     /// Minimum units of dest_asset they must receive. This is the per
     /// recipient slippage floor, passed through as amount_out_min to the
-    /// swap venue.
+    /// swap venue. Must be positive: execute_batch rejects a zero or negative
+    /// floor with InvalidAmount before any funds move, because a zero floor
+    /// protects nothing and would let a swap settle at any rate.
     pub dest_min: i128,
     /// Units of source asset allocated to this recipient.
     pub amount_in: i128,

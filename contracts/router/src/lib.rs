@@ -91,11 +91,18 @@ impl Router {
     /// Executes one payout run.
     ///
     /// Guards in order: not initialized, paused, sender auth, batch not
-    /// empty, batch within MAX_BATCH_RECIPIENTS, amounts consistent. Every
-    /// guard rejects with the sender's funds untouched; the full
+    /// empty, batch within MAX_BATCH_RECIPIENTS, every recipient's amount_in
+    /// and dest_min positive, allocation sum equal to total_source_amount.
+    /// Every guard rejects with the sender's funds untouched; the full
     /// total_source_amount is pulled from the sender into this contract only
     /// after all of them pass, then each recipient's allocation is swapped on
     /// the venue with the recipient's dest_min enforced as the output floor.
+    ///
+    /// A dest_min of zero is rejected. It is the only delivery guarantee the
+    /// contract makes and the amount_out_min the venue enforces, so a zero
+    /// floor would let a swap settle at any rate, including one that delivers
+    /// nothing while spending the recipient's whole allocation and still
+    /// reporting success.
     ///
     /// Refund policy: a recipient whose swap reverts has its source amount
     /// refunded to the sender at the end of the batch, because the venue
@@ -143,6 +150,15 @@ impl Router {
             // Reject non-positive allocations; a negative amount_in could
             // otherwise hide inside a sum that still matches the total.
             if recipient.amount_in <= 0 {
+                panic_with_error!(env, Error::InvalidAmount);
+            }
+            // Reject a non-positive slippage floor with the same error used
+            // for the other non-positive monetary fields. dest_min is the only
+            // delivery guarantee this contract makes and the amount_out_min
+            // the venue enforces, so accepting zero would let the recipient's
+            // allocation be spent for a delivery of nothing or of dust while
+            // the run still reported that recipient as a success.
+            if recipient.dest_min <= 0 {
                 panic_with_error!(env, Error::InvalidAmount);
             }
             allocated = match allocated.checked_add(recipient.amount_in) {

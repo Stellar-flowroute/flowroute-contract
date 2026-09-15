@@ -62,7 +62,7 @@ and is not changed by this release.
 
 - **Batched payouts.** One transaction funds up to `MAX_BATCH_RECIPIENTS` recipients (see [Batch size limit](#batch-size-limit)). The full source amount is pulled from the sender once and distributed in the same call.
 - **Multi-currency delivery.** Each recipient names a destination asset, and the router converts the source asset through the Soroswap Router.
-- **On-chain slippage floor.** Every recipient sets a minimum received amount (`dest_min`). FlowRoute measures the per-swap balance delta itself: an under-floor venue response returns `VenueUnderDelivered` and aborts the batch with an atomic rollback, so no partial payout or destination output is retained by the contract.
+- **On-chain slippage floor.** Every recipient must set a positive minimum received amount (`dest_min`); `execute_batch` rejects a zero or negative floor with `Error::InvalidAmount` before pulling the sender's total, because a zero floor would leave the recipient with no protection at all. FlowRoute measures the per-swap balance delta itself: an under-floor venue response returns `VenueUnderDelivered` and aborts the batch with an atomic rollback, so no partial payout or destination output is retained by the contract.
 - **Auditable settlement.** Each payout run and every per-recipient result is emitted as an on-chain event, and a payout counter records how many runs have executed.
 - **Failure isolation.** One recipient failing never aborts the batch. A swap that reverts is refunded to the sender at the end of the run.
 - **Pause switch.** The admin can pause execution between runs.
@@ -74,7 +74,7 @@ The router is a single Soroban contract in `contracts/router`. Storage holds the
 - `initialize(admin, swap_router)` sets the admin and immutable Soroswap Router venue, clears the paused flag, and resets the payout counter. It requires authorization from the supplied admin.
 - `set_paused(paused)` pauses or unpauses the batch executor. Requires admin auth.
 - `get_payout_count()` returns the number of payout runs executed so far.
-- `execute_batch(sender, source_asset, recipients, total_source_amount)` executes one payout run. It validates the batch, rejects batches larger than `MAX_BATCH_RECIPIENTS` before moving any funds, pulls the total amount from the sender, swaps each recipient's allocation on the venue with the recipient's `dest_min` enforced as the output floor, emits per-recipient and per-run events, refunds failed swaps to the sender, and never aborts on a single failure.
+- `execute_batch(sender, source_asset, recipients, total_source_amount)` executes one payout run. It validates the batch before moving any funds, rejecting a batch larger than `MAX_BATCH_RECIPIENTS` and any recipient whose allocation or `dest_min` is not positive, then pulls the total amount from the sender, swaps each recipient's allocation on the venue with the recipient's `dest_min` enforced as the output floor, emits per-recipient and per-run events, refunds failed swaps to the sender, and never aborts on a single failure.
 
 The application layer lives in the sibling repository `flowroute-app`.
 

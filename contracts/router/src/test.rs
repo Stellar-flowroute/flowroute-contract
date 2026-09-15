@@ -516,10 +516,12 @@ fn execute_batch_reverts_on_amount_mismatch() {
 
     let sender = Address::generate(&env);
     let source = Address::generate(&env);
+    // Otherwise valid, so the rejections below come from the declared total
+    // rather than from the per-recipient amount validation.
     let recipient = Recipient {
         address: Address::generate(&env),
         dest_asset: Address::generate(&env),
-        dest_min: 0,
+        dest_min: 100,
         amount_in: 100,
     };
     let recipients: Vec<Recipient> = vec![&env, recipient];
@@ -908,6 +910,173 @@ fn all_reverted_swaps_refund_all_source() {
     assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.sender), 1_000_000);
     assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.contract_id), 0);
     assert_eq!(TokenClient::new(&env, &setup.dest).balance(&setup.contract_id), 0);
+}
+
+// Slippage floor validation
+// -------------------------
+// `dest_min` is the only delivery guarantee the contract makes. It is checked
+// after each swap against the destination-token balance delta this contract
+// measured, and it is also passed to the venue as amount_out_min, so it is the
+// venue's own slippage protection too. A zero floor would therefore disable the
+// only protection a recipient has: a swap could settle at any rate, deliver
+// nothing, and still be recorded as a successful payout, contradicting the
+// documented meaning of a `PayoutResult` with `amount_delivered == 0`. A zero
+// floor is also not a minimum in the sense `Recipient.dest_min` documents, so
+// `execute_batch` rejects any non-positive floor with `InvalidAmount`, the same
+// error the contract already uses for its other non-positive monetary fields.
+
+#[test]
+fn execute_batch_rejects_zero_dest_min_before_funds_move() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 0,
+            amount_in: 100,
+        },
+    ];
+
+    let err = match client.try_execute_batch(&setup.sender, &setup.source, &recipients, &100) {
+        Ok(_) => panic!("a zero slippage floor must be rejected"),
+        Err(err) => err,
+    };
+    let all_events = env.events().all();
+
+    let err = err.unwrap();
+    assert!(err.is_type(xdr::ScErrorType::Contract));
+    assert_eq!(err.get_code(), Error::InvalidAmount as u32);
+
+    // Rejected before any funds move: the sender was not debited, the recipient
+    // received nothing, no payout was recorded and no event was emitted.
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("payout")), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 0);
+}
+
+#[test]
+fn execute_batch_rejects_negative_dest_min_before_funds_move() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: -1,
+            amount_in: 100,
+        },
+    ];
+
+    let err = match client.try_execute_batch(&setup.sender, &setup.source, &recipients, &100) {
+        Ok(_) => panic!("a negative slippage floor must be rejected"),
+        Err(err) => err,
+    };
+    let all_events = env.events().all();
+
+    let err = err.unwrap();
+    assert!(err.is_type(xdr::ScErrorType::Contract));
+    assert_eq!(err.get_code(), Error::InvalidAmount as u32);
+
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("payout")), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 0);
+}
+
+#[test]
+fn execute_batch_rejects_zero_dest_min_in_later_recipient_before_funds_move() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let first_recipient = Address::generate(&env);
+    let second_recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: first_recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 50,
+            amount_in: 50,
+        },
+        Recipient {
+            address: second_recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 0,
+            amount_in: 50,
+        },
+    ];
+
+    // One invalid recipient rejects the whole run, so the valid first
+    // recipient is not paid either and nothing is pulled from the sender.
+    let err = match client.try_execute_batch(&setup.sender, &setup.source, &recipients, &100) {
+        Ok(_) => panic!("one zero slippage floor must reject the whole batch"),
+        Err(err) => err,
+    };
+    let all_events = env.events().all();
+
+    let err = err.unwrap();
+    assert!(err.is_type(xdr::ScErrorType::Contract));
+    assert_eq!(err.get_code(), Error::InvalidAmount as u32);
+
+    let source_client = TokenClient::new(&env, &setup.source);
+    assert_eq!(source_client.balance(&setup.sender), 1_000_000);
+    assert_eq!(source_client.balance(&setup.contract_id), 0);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&first_recipient), 0);
+    assert_eq!(dest_client.balance(&second_recipient), 0);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(client.get_payout_count(), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("payout")), 0);
+    assert_eq!(count_events(&all_events, symbol_short!("batch")), 0);
+}
+
+#[test]
+fn execute_batch_accepts_smallest_positive_dest_min() {
+    let setup = setup_batch();
+    let env = setup.env.clone();
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 1,
+            amount_in: 1,
+        },
+    ];
+
+    // One unit is the smallest accepted floor, and it still has to be met.
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &1);
+
+    assert_eq!(results.get(0).unwrap().success, true);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 1);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 1);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(
+        TokenClient::new(&env, &setup.source).balance(&setup.contract_id),
+        0
+    );
+    assert_eq!(client.get_payout_count(), 1);
 }
 
 // Batch size limit
