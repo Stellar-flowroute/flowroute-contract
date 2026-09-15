@@ -69,10 +69,10 @@ impl Router {
     ///
     /// Refund policy: a recipient whose swap reverts has its source amount
     /// refunded to the sender at the end of the batch, because the venue
-    /// reverts atomically and the source never left this contract. A swap
-    /// that completes cannot deliver below dest_min (the venue enforces the
-    /// floor internally and reverts otherwise), so no successful call leaves
-    /// stuck funds.
+    /// reverts atomically and the source never left this contract. If a venue
+    /// incorrectly returns success below dest_min, its measured destination
+    /// output is returned to the sender immediately; the recipient receives
+    /// nothing and the payout is recorded as failed.
     ///
     /// One recipient failing never aborts the batch.
     pub fn execute_batch(
@@ -186,16 +186,19 @@ impl Router {
                             amount_delivered: received,
                         });
                     } else {
-                        // Defensive branch. The venue enforces the floor
-                        // internally and reverts otherwise, so a successful
-                        // call cannot deliver below dest_min. If a buggy or
-                        // dishonest venue ever returns Ok below the floor, the
-                        // recipient is failed and the consumed source is not
-                        // refundable because it already left the contract.
-                        // The delivered tokens then remain stranded here with
-                        // no rescue path, which is the accepted cost of the
-                        // spec-mandated rule that one recipient failing never
-                        // aborts the batch.
+                        // A non-conforming venue may return Ok while sending
+                        // less than its requested floor. Do not pay a partial
+                        // amount to the recipient or retain it here: return
+                        // exactly this swap's measured delta to the sender.
+                        // The balance delta excludes any pre-existing balance
+                        // of this destination asset in the contract.
+                        if received > 0 {
+                            dest_client.transfer(
+                                &contract_address,
+                                &MuxedAddress::from(&sender),
+                                &received,
+                            );
+                        }
                         events::payout(
                             &env,
                             payout_id,

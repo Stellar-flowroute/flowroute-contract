@@ -68,6 +68,48 @@ mod mock_router {
     }
 }
 
+/// Malicious venue that consumes the full source input, deliberately sends a
+/// non-zero amount below amount_out_min, and still reports success.
+mod under_delivering_router {
+    use soroban_sdk::{
+        contract, contractimpl, token::TokenClient, vec, Address, Env, MuxedAddress, Vec,
+    };
+
+    use crate::error::Error;
+
+    #[contract]
+    pub struct UnderDeliveringRouter;
+
+    #[contractimpl]
+    impl UnderDeliveringRouter {
+        pub fn swap_exact_tokens_for_tokens(
+            env: Env,
+            amount_in: i128,
+            amount_out_min: i128,
+            path: Vec<Address>,
+            to: Address,
+            _deadline: u64,
+        ) -> Result<Vec<i128>, Error> {
+            let token_in = TokenClient::new(&env, &path.get(0).unwrap());
+            let token_out = TokenClient::new(&env, &path.get(1).unwrap());
+            let self_address = env.current_contract_address();
+            let amount_out = if amount_out_min > 0 {
+                amount_out_min - 1
+            } else {
+                0
+            };
+
+            to.require_auth();
+            token_in.transfer(&to, &MuxedAddress::from(&self_address), &amount_in);
+            if amount_out > 0 {
+                token_out.transfer(&self_address, &MuxedAddress::from(&to), &amount_out);
+            }
+
+            Ok(vec![&env, amount_in, amount_out])
+        }
+    }
+}
+
 struct BatchSetup {
     env: Env,
     contract_id: Address,
@@ -103,6 +145,36 @@ fn setup_batch() -> BatchSetup {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
 
+    let sender = Address::generate(&env);
+    StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
+    StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
+
+    BatchSetup {
+        env,
+        contract_id,
+        sender,
+        source,
+        dest,
+        swap_router,
+    }
+}
+
+fn setup_under_delivering_batch() -> BatchSetup {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (contract_id, admin, _client) = setup_client(&env);
+    let client = RouterClient::new(&env, &contract_id);
+    let swap_router = env.register(under_delivering_router::UnderDeliveringRouter, ());
+    client.initialize(&admin, &swap_router);
+
+    let token_admin = Address::generate(&env);
+    let source = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let dest = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let sender = Address::generate(&env);
     StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
     StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
@@ -324,7 +396,7 @@ fn execute_batch_reverts_on_amount_mismatch() {
 }
 
 #[test]
-fn execute_batch_happy_path() {
+fn execute_batch_above_dest_min_succeeds() {
     let setup = setup_batch();
     let env = setup.env;
     let client = RouterClient::new(&env, &setup.contract_id);
@@ -338,6 +410,10 @@ fn execute_batch_happy_path() {
 
     let recipient_1 = Address::generate(&env);
     let recipient_2 = Address::generate(&env);
+    let other_dest = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    StellarAssetClient::new(&env, &other_dest).mint(&setup.swap_router, &10_000_000);
     let recipients: Vec<Recipient> = vec![
         &env,
         Recipient {
@@ -348,7 +424,7 @@ fn execute_batch_happy_path() {
         },
         Recipient {
             address: recipient_2.clone(),
-            dest_asset: setup.dest.clone(),
+            dest_asset: other_dest.clone(),
             dest_min: 50,
             amount_in: 100,
         },
@@ -369,7 +445,10 @@ fn execute_batch_happy_path() {
     // Recipients received their destination tokens.
     let dest_client = TokenClient::new(&env, &setup.dest);
     assert_eq!(dest_client.balance(&recipient_1), 200);
-    assert_eq!(dest_client.balance(&recipient_2), 100);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    let other_dest_client = TokenClient::new(&env, &other_dest);
+    assert_eq!(other_dest_client.balance(&recipient_2), 100);
+    assert_eq!(other_dest_client.balance(&setup.contract_id), 0);
 
     // The sender was debited exactly the batch total; the contract holds no
     // leftover source.
@@ -394,12 +473,13 @@ fn execute_batch_happy_path() {
         assert_eq!(payout.topics[1], xdr::ScVal::U64(1));
         assert_eq!(payout.topics[2], xdr::ScVal::from(&setup.sender));
         assert_eq!(payout.data[1], xdr::ScVal::from(&setup.source));
-        assert_eq!(payout.data[2], xdr::ScVal::from(&setup.dest));
         assert_eq!(payout.data[4], xdr::ScVal::Bool(true));
     }
     assert_eq!(payouts[0].data[0], xdr::ScVal::from(&recipient_1));
+    assert_eq!(payouts[0].data[2], xdr::ScVal::from(&setup.dest));
     assert_eq!(payouts[0].data[3], scval_i128(200));
     assert_eq!(payouts[1].data[0], xdr::ScVal::from(&recipient_2));
+    assert_eq!(payouts[1].data[2], xdr::ScVal::from(&other_dest));
     assert_eq!(payouts[1].data[3], scval_i128(100));
     let batch = &batches[0];
     assert_eq!(batch.topics[0], xdr::ScVal::from(symbol_short!("batch")));
@@ -415,6 +495,95 @@ fn execute_batch_happy_path() {
         configured_swap_router(&env, &setup.contract_id),
         Some(setup.swap_router.clone())
     );
+}
+
+#[test]
+fn execute_batch_exact_dest_min_succeeds() {
+    let setup = setup_batch();
+    let env = setup.env;
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 100,
+            amount_in: 100,
+        },
+    ];
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &100);
+
+    assert_eq!(results.get(0).unwrap().success, true);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 100);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 100);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.contract_id), 0);
+}
+
+#[test]
+fn under_delivering_success_returns_destination_output_to_sender() {
+    let setup = setup_under_delivering_batch();
+    let env = setup.env;
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 100,
+            amount_in: 100,
+        },
+    ];
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &100);
+    let all_events = env.events().all();
+
+    // The malicious venue returned Ok after sending 99, but the recipient is
+    // not partially paid and FlowRoute retains none of that current swap's
+    // destination output.
+    assert_eq!(results.get(0).unwrap().success, false);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 0);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 0);
+    assert_eq!(dest_client.balance(&setup.sender), 99);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
+    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.sender), 999_900);
+    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.contract_id), 0);
+
+    let (payouts, _) = spec_events(&all_events);
+    assert_eq!(payouts.len(), 1);
+    assert_eq!(payouts[0].data[3], scval_i128(0));
+    assert_eq!(payouts[0].data[4], xdr::ScVal::Bool(false));
+}
+
+#[test]
+fn preexisting_destination_balance_is_not_paid_to_recipient() {
+    let setup = setup_batch();
+    let env = setup.env;
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &setup.dest).mint(&setup.contract_id, &500);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: recipient.clone(),
+            dest_asset: setup.dest.clone(),
+            dest_min: 100,
+            amount_in: 100,
+        },
+    ];
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &100);
+
+    assert_eq!(results.get(0).unwrap().success, true);
+    assert_eq!(results.get(0).unwrap().amount_delivered, 100);
+    let dest_client = TokenClient::new(&env, &setup.dest);
+    assert_eq!(dest_client.balance(&recipient), 100);
+    assert_eq!(dest_client.balance(&setup.contract_id), 500);
 }
 
 /// Extracts the success flag (last data element) of every payout event.
@@ -517,6 +686,7 @@ fn execute_batch_failed_recipient_is_refunded() {
     let dest_client = TokenClient::new(&env, &setup.dest);
     assert_eq!(dest_client.balance(&failing_recipient), 0);
     assert_eq!(dest_client.balance(&good_recipient), 100);
+    assert_eq!(dest_client.balance(&setup.contract_id), 0);
 
     // The failed recipient's source was refunded to the sender: 1_000_000
     // minted minus the 200 batch total plus the 100 refund.
@@ -530,4 +700,34 @@ fn execute_batch_failed_recipient_is_refunded() {
     assert_eq!(payout_success_flags(&all_events), [false, true]);
 
     assert_eq!(client.get_payout_count(), 1);
+}
+
+#[test]
+fn all_reverted_swaps_refund_all_source() {
+    let setup = setup_batch();
+    let env = setup.env;
+    let client = RouterClient::new(&env, &setup.contract_id);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: Address::generate(&env),
+            dest_asset: setup.dest.clone(),
+            dest_min: 200,
+            amount_in: 100,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            dest_asset: setup.dest.clone(),
+            dest_min: 200,
+            amount_in: 100,
+        },
+    ];
+
+    let results = client.execute_batch(&setup.sender, &setup.source, &recipients, &200);
+
+    assert_eq!(results.get(0).unwrap().success, false);
+    assert_eq!(results.get(1).unwrap().success, false);
+    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.sender), 1_000_000);
+    assert_eq!(TokenClient::new(&env, &setup.source).balance(&setup.contract_id), 0);
+    assert_eq!(TokenClient::new(&env, &setup.dest).balance(&setup.contract_id), 0);
 }

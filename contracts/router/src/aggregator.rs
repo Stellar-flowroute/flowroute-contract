@@ -28,9 +28,10 @@ pub const DEADLINE_BUFFER_SECONDS: u64 = 300;
 // Fund flow: the router does not pull via allowance. It calls
 // to.require_auth() and transfers the input tokens from `to` directly to the
 // first pair contract. FlowRoute therefore passes itself as `to`, measures
-// its own destination-token balance delta after the call, enforces the
-// per-recipient floor on that delta, and forwards the received amount to the
-// recipient.
+// its own destination-token balance delta after the call, and only forwards
+// the received amount to the recipient when it satisfies the per-recipient
+// floor. A non-conforming successful response below that floor is returned to
+// the sender by the calling contract.
 //
 // Aggregator follow-up, verified interface from github.com/soroswap/aggregator,
 // contracts/aggregator/src/lib.rs and contracts/aggregator/src/models.rs:
