@@ -35,7 +35,9 @@ stellar contract deploy \
   --alias flowroute-router
 ```
 
-Initialize the deployed contract with the admin address (use the contract id printed by deploy, or the `flowroute-router` alias):
+Initialize the newly deployed FlowRoute Router with the admin address and the
+external Soroswap Router address for testnet (use the contract id printed by
+deploy, or the `flowroute-router` alias):
 
 ```bash
 stellar contract invoke \
@@ -43,13 +45,18 @@ stellar contract invoke \
   --source test-deployer \
   --network testnet \
   -- initialize \
-  --admin <ADMIN_ADDRESS>
+  --admin <ADMIN_ADDRESS> \
+  --swap_router CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD
 ```
 
 The initializer must authorize as the supplied admin: `test-deployer` must be
-that address or one of its signers. This is the exact build, deploy, and
-initialize sequence used for the live testnet deployment listed under Contract
-addresses.
+that address or one of its signers. The external Soroswap Router address is a
+testnet-specific deployment dependency; supply the appropriate verified venue
+address when deploying to another network.
+
+This API change requires a fresh FlowRoute Router deployment. The existing
+testnet FlowRoute Router listed below was initialized with the prior interface
+and is not changed by this release.
 
 ## Key Features
 
@@ -62,21 +69,21 @@ addresses.
 
 ## Architecture
 
-The router is a single Soroban contract in `contracts/router`. Storage holds the admin address, a paused flag, and a payout counter; swaps are delegated to the Soroswap Router venue. The public surface is four functions:
+The router is a single Soroban contract in `contracts/router`. Storage holds the admin address, an immutable external Soroswap Router address, a paused flag, and a payout counter. Swaps are delegated to that configured venue. The public surface is four functions:
 
-- `initialize(admin)` sets the admin, clears the paused flag, and resets the payout counter. It requires authorization from the supplied admin.
+- `initialize(admin, swap_router)` sets the admin and immutable Soroswap Router venue, clears the paused flag, and resets the payout counter. It requires authorization from the supplied admin.
 - `set_paused(paused)` pauses or unpauses the batch executor. Requires admin auth.
 - `get_payout_count()` returns the number of payout runs executed so far.
 - `execute_batch(sender, source_asset, recipients, total_source_amount)` executes one payout run. It validates the batch, pulls the total amount from the sender, swaps each recipient's allocation on the venue with the recipient's `dest_min` enforced as the output floor, emits per-recipient and per-run events, refunds failed swaps to the sender, and never aborts on a single failure.
 
 The application layer lives in the sibling repository `flowroute-app`.
 
-## Contract addresses (testnet)
+## Existing contract addresses (testnet)
 
 | Contract | Address |
 | --- | --- |
-| FlowRoute Router | `CBDWWJOW25KPUID432RZXFIPLHRYZY5KIXBT7FMC2L6LHFOITBMUX5LE` |
-| Soroswap Router | `CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD` |
+| FlowRoute Router (prior interface) | `CBDWWJOW25KPUID432RZXFIPLHRYZY5KIXBT7FMC2L6LHFOITBMUX5LE` |
+| External Soroswap Router | `CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD` |
 
 ## Contributing
 

@@ -22,16 +22,18 @@ pub struct Router;
 
 #[contractimpl]
 impl Router {
-    /// Sets the admin, clears the paused flag, and resets the payout counter.
+    /// Sets the admin and immutable swap venue, clears the paused flag, and
+    /// resets the payout counter.
     /// Requires authorization from the supplied admin so an unrelated caller
     /// cannot claim an uninitialized deployment. Reverts with
     /// AlreadyInitialized if the contract was already initialized.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address, swap_router: Address) {
         if storage::read_admin(&env).is_some() {
             panic_with_error!(env, Error::AlreadyInitialized);
         }
         admin.require_auth();
         storage::write_admin(&env, &admin);
+        storage::write_swap_router(&env, &swap_router);
         storage::write_paused(&env, &false);
         storage::write_payout_count(&env, &0);
         // Give the fresh entries the full TTL window so the contract does not
@@ -83,6 +85,10 @@ impl Router {
         if storage::read_admin(&env).is_none() {
             panic_with_error!(env, Error::NotInitialized);
         }
+        let swap_router = match storage::read_swap_router(&env) {
+            Some(router) => router,
+            None => panic_with_error!(env, Error::NotInitialized),
+        };
         if storage::read_paused(&env) {
             panic_with_error!(env, Error::Paused);
         }
@@ -141,6 +147,7 @@ impl Router {
             let path = vec![&env, source_asset.clone(), recipient.dest_asset.clone()];
             let swap_outcome = aggregator::swap(
                 &env,
+                &swap_router,
                 recipient.amount_in,
                 recipient.dest_min,
                 path,

@@ -3,6 +3,7 @@ use soroban_sdk::{contracttype, Address, Env};
 #[contracttype]
 pub enum DataKey {
     Admin,
+    SwapRouter,
     Paused,
     PayoutCount,
 }
@@ -36,6 +37,14 @@ pub fn read_admin(env: &Env) -> Option<Address> {
 
 pub fn write_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+}
+
+pub fn read_swap_router(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::SwapRouter)
+}
+
+pub fn write_swap_router(env: &Env, swap_router: &Address) {
+    env.storage().instance().set(&DataKey::SwapRouter, swap_router);
 }
 
 pub fn read_paused(env: &Env) -> bool {

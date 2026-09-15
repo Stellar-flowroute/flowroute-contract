@@ -7,7 +7,7 @@ use soroban_sdk::{
     vec, xdr, Address, Env, IntoVal, Symbol, Vec,
 };
 
-use crate::{aggregator, Recipient, Router, RouterClient};
+use crate::{storage, Recipient, Router, RouterClient};
 
 fn setup_client(env: &Env) -> (Address, Address, RouterClient<'_>) {
     let contract_id = env.register(Router, ());
@@ -16,9 +16,13 @@ fn setup_client(env: &Env) -> (Address, Address, RouterClient<'_>) {
     (contract_id, admin, client)
 }
 
-/// Mock swap venue. Registered at the venue address constant that the
-/// contract uses, so the contract calls this mock exactly as it would call
-/// the real Soroswap Router. It requires auth from `to`, pulls the source
+fn configured_swap_router(env: &Env, contract_id: &Address) -> Option<Address> {
+    env.as_contract(contract_id, || storage::read_swap_router(env))
+}
+
+/// Mock swap venue. Registered at the address supplied to initialize, so the
+/// contract calls this mock exactly as it would call the real Soroswap Router.
+/// It requires auth from `to`, pulls the source
 /// tokens from `to`, and delivers the destination tokens back to `to` at a
 /// fixed 1:1 rate. A requested floor above the deliverable amount reverts
 /// with SlippageExceeded, mirroring the real router's atomic revert.
@@ -70,6 +74,7 @@ struct BatchSetup {
     sender: Address,
     source: Address,
     dest: Address,
+    swap_router: Address,
 }
 
 /// Initializes the contract, registers the mock venue, and funds the sender
@@ -84,7 +89,11 @@ fn setup_batch() -> BatchSetup {
 
     let (contract_id, admin, _client) = setup_client(&env);
     let client = RouterClient::new(&env, &contract_id);
-    client.initialize(&admin);
+    // Register at a generated address rather than the former hardcoded
+    // testnet address. A fallback to that retired configuration makes every
+    // successful-payout test below fail because no venue exists there.
+    let swap_router = env.register(mock_router::MockRouter, ());
+    client.initialize(&admin, &swap_router);
 
     let token_admin = Address::generate(&env);
     let source = env
@@ -94,12 +103,9 @@ fn setup_batch() -> BatchSetup {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
 
-    let venue = Address::from_str(&env, aggregator::SOROSWAP_ROUTER_TESTNET);
-    env.register_at(&venue, mock_router::MockRouter, ());
-
     let sender = Address::generate(&env);
     StellarAssetClient::new(&env, &source).mint(&sender, &1_000_000);
-    StellarAssetClient::new(&env, &dest).mint(&venue, &10_000_000);
+    StellarAssetClient::new(&env, &dest).mint(&swap_router, &10_000_000);
 
     BatchSetup {
         env,
@@ -107,6 +113,7 @@ fn setup_batch() -> BatchSetup {
         sender,
         source,
         dest,
+        swap_router,
     }
 }
 
@@ -123,20 +130,25 @@ fn count_events(events: &soroban_sdk::testutils::ContractEvents, tag: Symbol) ->
 }
 
 #[test]
-fn initialize_sets_admin() {
+fn initialize_sets_admin_and_swap_router() {
     let env = Env::default();
     let (contract_id, admin, client) = setup_client(&env);
+    let swap_router = Address::generate(&env);
     client
         .mock_auths(&[MockAuth {
             address: &admin,
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "initialize",
-                args: (&admin,).into_val(&env),
+                args: (&admin, &swap_router).into_val(&env),
                 sub_invokes: &[],
             },
         }])
-        .initialize(&admin);
+        .initialize(&admin, &swap_router);
+
+    // The configured venue remains available to later contract calls.
+    assert_eq!(client.get_payout_count(), 0);
+    assert_eq!(configured_swap_router(&env, &contract_id), Some(swap_router));
 }
 
 #[test]
@@ -144,8 +156,10 @@ fn initialize_requires_supplied_admin_auth() {
     let env = Env::default();
     let (contract_id, admin, client) = setup_client(&env);
     let other = Address::generate(&env);
+    let swap_router = Address::generate(&env);
 
-    assert!(client.try_initialize(&admin).is_err());
+    assert!(client.try_initialize(&admin, &swap_router).is_err());
+    assert_eq!(configured_swap_router(&env, &contract_id), None);
 
     // Authorization from an address other than the proposed admin cannot
     // initialize the contract.
@@ -155,12 +169,13 @@ fn initialize_requires_supplied_admin_auth() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "initialize",
-                args: (&admin,).into_val(&env),
+                args: (&admin, &swap_router).into_val(&env),
                 sub_invokes: &[],
             },
         }])
-        .try_initialize(&admin)
+        .try_initialize(&admin, &swap_router)
         .is_err());
+    assert_eq!(configured_swap_router(&env, &contract_id), None);
 
     client
         .mock_auths(&[MockAuth {
@@ -168,28 +183,38 @@ fn initialize_requires_supplied_admin_auth() {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "initialize",
-                args: (&admin,).into_val(&env),
+                args: (&admin, &swap_router).into_val(&env),
                 sub_invokes: &[],
             },
         }])
-        .initialize(&admin);
+        .initialize(&admin, &swap_router);
 }
 
 #[test]
-fn initialize_second_call_reverts() {
+fn router_cannot_be_replaced_after_initialization() {
     let env = Env::default();
-    let (_contract_id, admin, client) = setup_client(&env);
-    client.mock_all_auths().initialize(&admin);
+    let (contract_id, admin, client) = setup_client(&env);
+    let swap_router = Address::generate(&env);
+    let replacement_router = Address::generate(&env);
+    client.mock_all_auths().initialize(&admin, &swap_router);
 
-    let other = Address::generate(&env);
-    assert!(client.try_initialize(&other).is_err());
+    // Even the authorized admin cannot re-initialize to a replacement venue.
+    assert!(client
+        .mock_all_auths()
+        .try_initialize(&admin, &replacement_router)
+        .is_err());
+    assert_eq!(
+        configured_swap_router(&env, &contract_id),
+        Some(swap_router)
+    );
 }
 
 #[test]
 fn set_paused_requires_admin_auth() {
     let env = Env::default();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.mock_all_auths().initialize(&admin);
+    let swap_router = Address::generate(&env);
+    client.mock_all_auths().initialize(&admin, &swap_router);
 
     // No auth is mocked for the admin signature, so the call reverts.
     assert!(client.try_set_paused(&true).is_err());
@@ -200,7 +225,7 @@ fn set_paused_admin_roundtrip() {
     let env = Env::default();
     env.mock_all_auths();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &Address::generate(&env));
 
     client.set_paused(&true);
     client.set_paused(&false);
@@ -219,7 +244,9 @@ fn set_paused_before_initialize_reverts() {
 fn get_payout_count_starts_at_zero() {
     let env = Env::default();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .initialize(&admin, &Address::generate(&env));
 
     assert_eq!(client.get_payout_count(), 0);
 }
@@ -243,7 +270,7 @@ fn execute_batch_reverts_when_paused() {
     let env = Env::default();
     env.mock_all_auths();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &Address::generate(&env));
     client.set_paused(&true);
 
     let sender = Address::generate(&env);
@@ -259,7 +286,7 @@ fn execute_batch_reverts_on_empty_batch() {
     let env = Env::default();
     env.mock_all_auths();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &Address::generate(&env));
 
     let sender = Address::generate(&env);
     let source = Address::generate(&env);
@@ -274,7 +301,7 @@ fn execute_batch_reverts_on_amount_mismatch() {
     let env = Env::default();
     env.mock_all_auths();
     let (_contract_id, admin, client) = setup_client(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &Address::generate(&env));
 
     let sender = Address::generate(&env);
     let source = Address::generate(&env);
@@ -301,6 +328,13 @@ fn execute_batch_happy_path() {
     let setup = setup_batch();
     let env = setup.env;
     let client = RouterClient::new(&env, &setup.contract_id);
+
+    // execute_batch reads the stored, explicitly initialized venue. setup_batch
+    // intentionally has no mock at the old hardcoded testnet router address.
+    assert_eq!(
+        configured_swap_router(&env, &setup.contract_id),
+        Some(setup.swap_router.clone())
+    );
 
     let recipient_1 = Address::generate(&env);
     let recipient_2 = Address::generate(&env);
@@ -377,6 +411,10 @@ fn execute_batch_happy_path() {
 
     // The payout counter advanced.
     assert_eq!(client.get_payout_count(), 1);
+    assert_eq!(
+        configured_swap_router(&env, &setup.contract_id),
+        Some(setup.swap_router.clone())
+    );
 }
 
 /// Extracts the success flag (last data element) of every payout event.

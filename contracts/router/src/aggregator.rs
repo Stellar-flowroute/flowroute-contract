@@ -9,13 +9,6 @@ use soroban_sdk::{contractclient, Address, Env, Vec};
 
 use crate::error::Error;
 
-/// Deployed Soroswap Router on Stellar testnet. Verified this session from
-/// github.com/soroswap/core, file public/testnet.contracts.json, ids.router.
-/// No admin function may change the venue in the MVP, so the address is a
-/// constant. Change this constant when deploying against another network.
-pub const SOROSWAP_ROUTER_TESTNET: &str =
-    "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
-
 /// The router rejects a swap whose deadline has passed. Every swap gets a
 /// fixed window starting from the current ledger timestamp.
 pub const DEADLINE_BUFFER_SECONDS: u64 = 300;
@@ -72,22 +65,19 @@ pub trait RouterInterface {
     ) -> Result<Vec<i128>, Error>;
 }
 
-pub fn venue_address(env: &Env) -> Address {
-    Address::from_str(env, SOROSWAP_ROUTER_TESTNET)
-}
-
 /// Executes one recipient's swap on the venue. The venue enforces
 /// amount_out_min internally and reverts atomically on any failure, so on an
 /// error the recipient's source amount remains in this contract and can be
 /// refunded to the sender.
 pub fn swap(
     env: &Env,
+    swap_router: &Address,
     amount_in: i128,
     amount_out_min: i128,
     path: Vec<Address>,
     to: Address,
 ) -> Result<Vec<i128>, Error> {
-    let client = SoroswapRouterClient::new(env, &venue_address(env));
+    let client = SoroswapRouterClient::new(env, swap_router);
     let deadline = env.ledger().timestamp() + DEADLINE_BUFFER_SECONDS;
     match client.try_swap_exact_tokens_for_tokens(
         &amount_in,
